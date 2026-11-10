@@ -79,11 +79,150 @@ pub fn fold(s: &str) -> String {
         .collect()
 }
 
-/// Coloca un SVG completo dentro de otro, en el cuadrado (x, y, lado). Se
-/// anida entero para conservar sus espacios de nombres y definiciones.
+// ---------------------------------------------------------------------------
+// SVG externos (iconos, ilustraciones, stickers)
+
+/// Atributos de la etiqueta raíz `<svg …>`: (inicio, fin de la etiqueta, lista).
+fn root_attrs(svg: &str) -> Option<(usize, usize, Vec<(String, String)>)> {
+    let start = svg.find("<svg")?;
+    let bytes = svg.as_bytes();
+    let mut i = start + 4;
+    let mut attrs = Vec::new();
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match bytes.get(i)? {
+            b'>' => return Some((start, i, attrs)),
+            b'/' => i += 1,
+            _ => {
+                let name_start = i;
+                while i < bytes.len() && !matches!(bytes[i], b'=' | b'>' | b'/') && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let name = svg[name_start..i].to_string();
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let mut value = String::new();
+                if bytes.get(i) == Some(&b'=') {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    let quote = *bytes.get(i)?;
+                    if quote == b'"' || quote == b'\'' {
+                        let end = i + 1 + svg[i + 1..].find(quote as char)?;
+                        value = svg[i + 1..end].to_string();
+                        i = end + 1;
+                    }
+                }
+                attrs.push((name, value));
+            }
+        }
+    }
+}
+
+fn number(v: &str) -> Option<f32> {
+    let n: String = v.trim().chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+    n.parse().ok().filter(|n: &f32| *n > 0.0)
+}
+
+/// viewBox de un SVG (o su ancho y alto si no tiene).
+pub fn view_box(svg: &str) -> Option<(f32, f32, f32, f32)> {
+    let (_, _, attrs) = root_attrs(svg)?;
+    let get = |n: &str| attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+    if let Some(vb) = get("viewBox") {
+        let p: Vec<f32> = vb.split(|c: char| c == ',' || c.is_whitespace()).filter_map(|t| t.parse().ok()).collect();
+        if p.len() == 4 && p[2] > 0.0 && p[3] > 0.0 {
+            return Some((p[0], p[1], p[2], p[3]));
+        }
+    }
+    Some((0.0, 0.0, number(get("width")?)?, number(get("height")?)?))
+}
+
+/// Proporción ancho / alto de un SVG.
+pub fn svg_aspect(svg: &str) -> f32 {
+    view_box(svg).map(|(_, _, w, h)| w / h).unwrap_or(1.0)
+}
+
+/// Quita de `s` cada trozo que empiece en `open` y acabe en `close` (inclusive).
+fn remove_between(s: &mut String, open: &str, close: &str) {
+    while let Some(a) = s.find(open) {
+        let Some(len) = s[a..].find(close) else { break };
+        s.replace_range(a..a + len + close.len(), "");
+    }
+}
+
+/// Limpia un SVG descargado para guardarlo en el proyecto: sin cabeceras,
+/// comentarios ni datos privados de los editores, con las entidades
+/// sustituidas y comprobando que se puede dibujar.
+pub fn sanitize_svg(raw: &str) -> Option<String> {
+    let mut s = raw.to_string();
+    let mut entities = Vec::new();
+    if let Some(a) = s.find("<!DOCTYPE") {
+        let rest = &s[a..];
+        let end = match (rest.find('['), rest.find('>')) {
+            (Some(b), Some(g)) if b < g => rest.find("]>").map(|e| e + 2),
+            (_, Some(g)) => Some(g + 1),
+            _ => None,
+        }?;
+        for decl in rest[..end].split("<!ENTITY").skip(1) {
+            let mut parts = decl.trim_start().splitn(2, char::is_whitespace);
+            let (Some(name), Some(value)) = (parts.next(), parts.next()) else { continue };
+            if let Some(v) = value.trim_start().strip_prefix('"').and_then(|v| v.split('"').next()) {
+                entities.push((format!("&{name};"), v.to_string()));
+            }
+        }
+        s.replace_range(a..a + end, "");
+    }
+    remove_between(&mut s, "<?", "?>");
+    remove_between(&mut s, "<!--", "-->");
+    remove_between(&mut s, "<metadata", "</metadata>");
+    remove_between(&mut s, "<i:pgf", "</i:pgf>");
+    for (name, value) in entities {
+        s = s.replace(&name, &value);
+    }
+    let s = s[s.find("<svg")?..].trim().to_string();
+    let tree = usvg::Tree::from_str(&s, &usvg::Options::default()).ok()?;
+    (tree.size().width() > 0.0 && tree.size().height() > 0.0).then_some(s)
+}
+
+/// Coloca un SVG completo dentro de otro, en el rectángulo (x, y, w, h),
+/// conservando su proporción. Se anida entero para no perder sus espacios
+/// de nombres ni sus definiciones; se cambian solo posición y tamaño.
+fn nest_svg_rect(src: &str, x: f32, y: f32, w: f32, h: f32) -> Option<String> {
+    let (_, end, attrs) = root_attrs(src)?;
+    let (vx, vy, vw, vh) = view_box(src)?;
+    let mut tag = format!("<svg x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" viewBox=\"{vx} {vy} {vw} {vh}\"");
+    for (k, v) in attrs.iter().filter(|(k, _)| !matches!(k.as_str(), "x" | "y" | "width" | "height" | "viewBox")) {
+        let _ = write!(tag, " {k}=\"{}\"", v.replace('"', "&quot;"));
+    }
+    let self_closing = src[..end].ends_with('/');
+    Some(if self_closing { tag + "/>" } else { tag + &src[end..] })
+}
+
+/// Coloca un SVG completo dentro de otro, en el cuadrado (x, y, lado).
 fn nest_svg(src: &str, x: f32, y: f32, side: f32) -> Option<String> {
-    let start = src.find("<svg")?;
-    Some(format!("<svg x=\"{x}\" y=\"{y}\" width=\"{side}\" height=\"{side}\"{}", &src[start + 4..]))
+    nest_svg_rect(src, x, y, side, side)
+}
+
+/// Filtro de calcomanía: borde blanco de radio `r` y una sombra suave.
+fn sticker_filter(r: f32) -> String {
+    format!(
+        concat!(
+            "<defs><filter id=\"st\" x=\"-20%\" y=\"-20%\" width=\"140%\" height=\"140%\" color-interpolation-filters=\"sRGB\">",
+            "<feMorphology in=\"SourceAlpha\" operator=\"dilate\" radius=\"{r}\" result=\"d\"/>",
+            "<feFlood flood-color=\"#ffffff\"/><feComposite in2=\"d\" operator=\"in\" result=\"outline\"/>",
+            "<feGaussianBlur in=\"d\" stdDeviation=\"{blur}\"/><feOffset dy=\"{dy}\" result=\"b\"/>",
+            "<feFlood flood-color=\"#000000\" flood-opacity=\"0.35\"/><feComposite in2=\"b\" operator=\"in\" result=\"shadow\"/>",
+            "<feMerge><feMergeNode in=\"shadow\"/><feMergeNode in=\"outline\"/><feMergeNode in=\"SourceGraphic\"/></feMerge>",
+            "</filter></defs>"
+        ),
+        r = r,
+        blur = r * 0.6,
+        dy = r * 0.5
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -290,22 +429,8 @@ pub fn layer_svg(kind: &Kind, w: f32, h: f32) -> Option<String> {
             if *sticker {
                 let r = side * 0.045;
                 let pad = r * 2.2;
-                format!(
-                    concat!(
-                        "<defs><filter id=\"st\" x=\"-20%\" y=\"-20%\" width=\"140%\" height=\"140%\" color-interpolation-filters=\"sRGB\">",
-                        "<feMorphology in=\"SourceAlpha\" operator=\"dilate\" radius=\"{r}\" result=\"d\"/>",
-                        "<feFlood flood-color=\"#ffffff\"/><feComposite in2=\"d\" operator=\"in\" result=\"outline\"/>",
-                        "<feGaussianBlur in=\"d\" stdDeviation=\"{blur}\"/><feOffset dy=\"{dy}\" result=\"b\"/>",
-                        "<feFlood flood-color=\"#000000\" flood-opacity=\"0.35\"/><feComposite in2=\"b\" operator=\"in\" result=\"shadow\"/>",
-                        "<feMerge><feMergeNode in=\"shadow\"/><feMergeNode in=\"outline\"/><feMergeNode in=\"SourceGraphic\"/></feMerge>",
-                        "</filter></defs>",
-                        "<g filter=\"url(#st)\">{inner}</g>"
-                    ),
-                    r = r,
-                    blur = r * 0.6,
-                    dy = r * 0.5,
-                    inner = nest_svg(src, (w - side) / 2.0 + pad, (h - side) / 2.0 + pad, side - 2.0 * pad)?
-                )
+                let inner = nest_svg(src, (w - side) / 2.0 + pad, (h - side) / 2.0 + pad, side - 2.0 * pad)?;
+                format!("{}<g filter=\"url(#st)\">{inner}</g>", sticker_filter(r))
             } else {
                 nest_svg(src, (w - side) / 2.0, (h - side) / 2.0, side)?
             }
@@ -321,6 +446,24 @@ pub fn layer_svg(kind: &Kind, w: f32, h: f32) -> Option<String> {
             }
         }
         Kind::Frame { frame, color, thickness } => frame_body(*frame, w, h, *thickness, *color),
+        Kind::Graphic { svg, tint, sticker, .. } => {
+            let tinted;
+            let src = match tint {
+                Some(c) => {
+                    tinted = svg.replace("currentColor", &format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]));
+                    &tinted
+                }
+                None => svg,
+            };
+            if *sticker {
+                let r = w.min(h) * 0.04;
+                let pad = r * 2.2;
+                let inner = nest_svg_rect(src, pad, pad, w - 2.0 * pad, h - 2.0 * pad)?;
+                format!("{}<g filter=\"url(#st)\">{inner}</g>", sticker_filter(r))
+            } else {
+                nest_svg_rect(src, 0.0, 0.0, w, h)?
+            }
+        }
         _ => return None,
     };
     Some(format!(
@@ -415,6 +558,35 @@ mod tests {
             // El centro de un marco queda libre para ver la foto.
             assert_eq!(img.get_pixel(200, 230)[3], 0, "{frame:?} tapa el centro");
         }
+    }
+
+    #[test]
+    fn limpia_svg_de_illustrator_y_lo_dibuja() {
+        let raw = r##"<?xml version="1.0"?>
+<!-- Generator: Adobe Illustrator -->
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x" [
+  <!ENTITY ns_ai "http://ns.adobe.com/AdobeIllustrator/10.0/">
+]>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:i="&ns_ai;" width="200px" height="100px" viewBox="0 0 200 100">
+<metadata>mucho texto</metadata><rect width="200" height="100" fill="#ff0000" i:extraneous="self"/></svg>"##;
+        let clean = sanitize_svg(raw).expect("se limpia");
+        assert!(!clean.contains("DOCTYPE") && !clean.contains("metadata") && clean.starts_with("<svg"));
+        assert_eq!(svg_aspect(&clean), 2.0);
+        let k = Kind::Graphic { svg: clean, source: "freesvg:1".into(), name: "rojo".into(), tint: None, sticker: false };
+        let img = rasterize(&layer_svg(&k, 200.0, 100.0).unwrap(), 1.0, (0.0, 0.0), (200, 100)).unwrap();
+        assert_eq!(img.get_pixel(100, 50).0, [255, 0, 0, 255]);
+        assert!(sanitize_svg("<html>no es svg</html>").is_none());
+    }
+
+    #[test]
+    fn icono_toma_el_color_elegido() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path fill="currentColor" d="M0 0h24v24H0z"/></svg>"#;
+        let k = Kind::Graphic { svg: svg.into(), source: "iconify:x:y".into(), name: "x".into(), tint: Some([0, 128, 255, 255]), sticker: false };
+        let img = rasterize(&layer_svg(&k, 48.0, 48.0).unwrap(), 1.0, (0.0, 0.0), (48, 48)).unwrap();
+        assert_eq!(img.get_pixel(24, 24).0, [0, 128, 255, 255]);
+        // Mantiene la proporción dentro de una caja más ancha.
+        let img = rasterize(&layer_svg(&k, 96.0, 48.0).unwrap(), 1.0, (0.0, 0.0), (96, 48)).unwrap();
+        assert_eq!(img.get_pixel(5, 24)[3], 0);
     }
 
     #[test]

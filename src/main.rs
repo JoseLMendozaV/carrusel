@@ -1,8 +1,11 @@
 //! Carrusel — creador de carruseles panorámicos para Instagram (estilo SCRL).
 
 mod doc;
+mod layers;
 mod library;
+mod online;
 mod render;
+mod scrapbook;
 mod vector;
 mod video;
 
@@ -157,6 +160,7 @@ struct App {
     play_videos: bool,
     vector_tex: HashMap<u64, VectorTex>,
     library: library::Library,
+    layers_ui: layers::LayersUi,
     /// Slide donde se colocan los elementos nuevos (el último en el que se hizo clic).
     focus_slide: u32,
     failed: HashMap<PathBuf, String>,
@@ -208,6 +212,7 @@ impl App {
             play_videos: true,
             vector_tex: HashMap::new(),
             library: library::Library::default(),
+            layers_ui: layers::LayersUi::default(),
             focus_slide: 0,
             failed: HashMap::new(),
             pending: 0,
@@ -524,6 +529,13 @@ impl App {
                 self.selected = Some(id);
             }
             library::Action::Text(preset) => self.add_text(preset),
+            library::Action::Graphic { svg, source, name, tint } => {
+                // Ilustraciones algo más grandes que iconos y stickers; siempre con su proporción.
+                let side = if source.starts_with("freesvg:") { sw * 0.6 } else { sw * 0.4 };
+                let aspect = vector::svg_aspect(&svg);
+                let (w, h) = if aspect >= 1.0 { (side, side / aspect) } else { (side * aspect, side) };
+                self.add_centered(Kind::Graphic { svg, source, name, tint, sticker: false }, w, h);
+            }
         }
     }
 
@@ -871,7 +883,7 @@ impl App {
             self.delete_selected();
         }
         if nudge != Vec2::ZERO {
-            if let Some(id) = self.selected {
+            if let Some(id) = self.selected.filter(|id| self.doc.layers.iter().any(|l| l.id == *id && !l.locked)) {
                 self.checkpoint();
                 if let Some(l) = self.doc.layer_mut(id) {
                     l.x += nudge.x;
@@ -1099,8 +1111,14 @@ impl App {
         let slide = self.doc.slide_of(&self.doc.layers[idx]);
         let is_media = self.doc.layers[idx].is_media();
         let what = if self.doc.layers[idx].is_image() { "foto" } else { "video" };
-        ui.heading(self.doc.layers[idx].kind.label());
-        ui.weak(format!("En el slide {}", slide + 1));
+        ui.heading(self.layer_name(&self.doc.layers[idx]));
+        ui.weak(format!("{} · en el slide {}", self.doc.layers[idx].kind.label(), slide + 1));
+        if self.doc.layers[idx].locked {
+            ui.colored_label(Color32::from_rgb(255, 190, 80), "🔒 Capa bloqueada: desbloquéala en el panel Capas para moverla.");
+        }
+        if self.doc.layers[idx].hidden {
+            ui.colored_label(Color32::from_rgb(255, 190, 80), "Capa oculta: no se ve ni se exporta.");
+        }
         ui.add_space(8.0);
 
         // Los controles continuos se agrupan en un solo paso de deshacer.
@@ -1270,6 +1288,36 @@ impl App {
                         ui.weak("El grosor de la línea es el alto de su caja: estírala desde arriba o abajo.");
                     }
                 }
+                Kind::Graphic { source, name, tint, sticker, svg } => {
+                    ui.label(name.as_str());
+                    if let Some(icon) = source.strip_prefix("iconify:") {
+                        let prefix = icon.split(':').next().unwrap_or("");
+                        match online::icon_set(prefix) {
+                            Some(set) => {
+                                ui.weak(format!("{} · licencia {}", set.name, set.license));
+                                if set.spdx.starts_with("CC-BY") {
+                                    ui.weak("Esta licencia pide mencionar al autor del icono al publicar.");
+                                }
+                            }
+                            None => {
+                                ui.weak(format!("Icono de Iconify ({prefix})"));
+                            }
+                        }
+                        ui.hyperlink_to("Ver en Iconify", format!("https://icon-sets.iconify.design/{prefix}/"));
+                    } else if source.starts_with("freesvg:") {
+                        ui.weak("FreeSVG · dominio público (CC0)");
+                    } else {
+                        ui.weak("Colección scrapbook de Carrusel");
+                    }
+                    if svg.contains("currentColor") {
+                        let mut c = tint.unwrap_or([40, 40, 40, 255]);
+                        if color_row(ui, "Color", &mut c) {
+                            *tint = Some(c);
+                            changed = true;
+                        }
+                    }
+                    changed |= ui.checkbox(sticker, "Efecto calcomanía (borde blanco y sombra)").changed();
+                }
                 Kind::Frame { frame, color, thickness } => {
                     egui::ComboBox::from_label("Estilo").selected_text(frame.label()).show_ui(ui, |ui| {
                         for k in FrameKind::ALL {
@@ -1350,7 +1398,7 @@ impl App {
         let rgba = |c: [u8; 4], opacity: f32| {
             Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (c[3] as f32 * opacity).round() as u8)
         };
-        for l in &self.doc.layers {
+        for l in self.doc.layers.iter().filter(|l| !l.hidden) {
             let rect = Rect::from_min_max(to_screen(l.x, l.y), to_screen(l.x + l.w, l.y + l.h));
             // Los textos con fondo o sombra sobresalen un poco de su caja.
             if !painter.clip_rect().intersects(rect.expand(40.0)) {
@@ -1475,7 +1523,7 @@ impl App {
                 .layers
                 .iter()
                 .filter_map(|l| match &l.kind {
-                    Kind::Video { path, start, .. } if self.videos.contains_key(path) => Some((l.id, path.clone(), *start)),
+                    Kind::Video { path, start, .. } if !l.hidden && self.videos.contains_key(path) => Some((l.id, path.clone(), *start)),
                     _ => None,
                 })
                 .collect()
@@ -1708,11 +1756,13 @@ impl App {
 
             // Selección.
             let handle = 12.0;
+            // Las capas bloqueadas u ocultas se ven seleccionadas pero sin tiradores.
             let sel = self.selected.and_then(|id| self.doc.layers.iter().find(|l| l.id == id)).cloned();
+            let sel_editable = sel.as_ref().is_some_and(|l| !l.locked && !l.hidden);
             let sel_rect = sel.as_ref().map(|l| Rect::from_min_max(to_screen(l.x, l.y), to_screen(l.x + l.w, l.y + l.h)));
             let sel_is_media = sel.as_ref().is_some_and(|l| l.is_media());
             // Formas y marcos se estiran desde los lados; fotos y videos se recortan.
-            let sel_has_edges = sel.as_ref().is_some_and(|l| l.is_media() || l.is_stretchy());
+            let sel_has_edges = sel_editable && sel.as_ref().is_some_and(|l| l.is_media() || l.is_stretchy());
 
             // Mientras se recorta o se mueve dentro del marco, la foto entera se
             // ve en transparente para saber hasta dónde se puede llegar.
@@ -1738,7 +1788,12 @@ impl App {
                 }
             }
 
-            if let Some(r) = sel_rect {
+            if let (Some(r), false) = (sel_rect, sel_editable) {
+                // Bloqueada u oculta: contorno gris discontinuo, sin tiradores.
+                let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                painter.extend(Shape::dashed_line(&pts, Stroke::new(1.5, Color32::from_gray(150)), 6.0, 4.0));
+            }
+            if let Some(r) = sel_rect.filter(|_| sel_editable) {
                 painter.rect_stroke(r, 0.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
                 if sel_has_edges {
                     for (_, h) in edge_handles(r) {
@@ -1752,14 +1807,15 @@ impl App {
             }
 
             // ----- interacción -----
-            let on_corner = |p: Pos2| sel_rect.is_some_and(|r| Rect::from_center_size(r.max, Vec2::splat(handle + 6.0)).contains(p));
+            let on_corner =
+                |p: Pos2| sel_editable && sel_rect.is_some_and(|r| Rect::from_center_size(r.max, Vec2::splat(handle + 6.0)).contains(p));
             let on_edge = |p: Pos2| -> Option<Edge> {
                 let r = sel_rect.filter(|_| sel_has_edges)?;
                 edge_handles(r).into_iter().find(|(_, h)| h.expand(6.0).contains(p)).map(|(e, _)| e)
             };
             let hit = |doc: &Doc, p: Pos2| -> Option<u64> {
                 let c = to_canvas(p);
-                doc.layers.iter().rev().find(|l| l.contains(c.x, c.y)).map(|l| l.id)
+                doc.layers.iter().rev().find(|l| !l.hidden && !l.locked && l.contains(c.x, c.y)).map(|l| l.id)
             };
             let command = ctx.input(|i| i.modifiers.command);
 
@@ -1930,6 +1986,20 @@ impl App {
                         self.reorder(0, true);
                         ui.close();
                     }
+                    if ui.button("Ocultar capa").clicked() {
+                        if let Some(i) = self.selected.and_then(|id| self.doc.index_of(id)) {
+                            self.checkpoint();
+                            self.doc.layers[i].hidden = true;
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Bloquear capa").clicked() {
+                        if let Some(i) = self.selected.and_then(|id| self.doc.index_of(id)) {
+                            self.checkpoint();
+                            self.doc.layers[i].locked = true;
+                        }
+                        ui.close();
+                    }
                     if ui.button("Eliminar capa").clicked() {
                         self.delete_selected();
                         ui.close();
@@ -2072,14 +2142,22 @@ impl eframe::App for App {
             });
         });
         if self.library.open {
-            egui::Panel::left("library").resizable(true).default_size(250.0).show(ui, |ui| {
+            egui::Panel::left("library")
+                .resizable(true)
+                .default_size(250.0)
+                .size_range(library::PANEL_MIN..=library::PANEL_MAX)
+                .show(ui, |ui| {
                 ui.add_space(8.0);
                 if let Some(action) = self.library.ui(ui) {
                     self.apply_library(action);
                 }
             });
         }
-        egui::Panel::right("inspector").resizable(true).default_size(270.0).show(ui, |ui| {
+        egui::Panel::right("inspector").resizable(true).default_size(280.0).show(ui, |ui| {
+            // Capas abajo, como en Photoshop; el inspector ocupa el resto.
+            egui::Panel::bottom("layers").resizable(true).default_size(280.0).size_range(120.0..=700.0).show(ui, |ui| {
+                self.layers_panel(ui);
+            });
             ui.add_space(8.0);
             egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
         });

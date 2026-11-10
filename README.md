@@ -15,6 +15,10 @@ Trabajas sobre **un lienzo continuo** dividido en slides. Lo que cruce la línea
 - Textos multilínea con tamaño, color, alineación, recuadro de fondo y sombra (más estilos listos en la biblioteca); puedes elegir cualquier fuente `.ttf`/`.otf`/`.ttc` de tu Mac.
 - **Biblioteca** (panel izquierdo):
   - **Emojis y calcomanías**: 1.869 emojis en **dos estilos**, Twemoji (plano) y **Google Noto** (con degradados y banderas ondeadas), todos en SVG y nítidos a cualquier tamaño. Buscador en español («corazón», «fuego», «gato»…) y 9 categorías. Con «Como calcomanía» llevan borde blanco y sombra; el estilo de un emoji se puede cambiar después en el inspector.
+  - **Stickers scrapbook** (colección propia de Carrusel, 145 diseños): cintas washi (lisas, rayas, lunares, cuadros, corazones), papeles (notas adhesivas, papel rasgado, hojas de cuaderno), etiquetas (colgantes, boletos, insignias, cintas de título, banderines), clips y chinchetas, garabatos a mano, flores y hojas, y sellos postales. Con buscador en español y categorías.
+  - **Iconos** de [Iconify](https://iconify.design): unos 475 000 iconos de código abierto, con búsqueda (también en español) y color a elegir. Solo se muestran colecciones con licencias aptas para publicar (se excluyen las no comerciales y GPL); el inspector indica la licencia de cada icono.
+  - **Ilustraciones** de [FreeSVG](https://freesvg.org): imágenes decorativas de dominio público (CC0). Su catálogo exige una cuenta gratuita: entras una vez en la pestaña y Carrusel guarda solo la sesión, nunca la contraseña.
+  - Iconos, ilustraciones y stickers se guardan dentro del proyecto, así que se abren y exportan sin conexión, y también admiten el efecto calcomanía.
   - **Formas**: rectángulo, redondeado, círculo, triángulo, estrella, corazón, flecha, línea, bocadillo y estallido, con relleno y borde.
   - **Marcos**: simple, doble línea, Polaroid, película, esquinas y discontinuo. Con una foto seleccionada, el marco se ajusta a ella.
   - **Textos**: título, subtítulo, párrafo, etiqueta, resaltado y texto sobre foto.
@@ -23,6 +27,7 @@ Trabajas sobre **un lienzo continuo** dividido en slides. Lo que cruce la línea
 - Esquinas redondeadas en las fotos y opacidad en cualquier capa.
 - Clic derecho sobre el lienzo: insertar un slide antes o después, eliminar un slide (lo que sigue se recoloca) y acciones de la capa.
 - **Vista previa** tipo Instagram: un slide a la vez, deslizando con el ratón o con ← →, con puntos de paginación y contador.
+- **Panel de Capas** (abajo a la derecha, como en Photoshop): todas las capas de la que está al frente a la del fondo, con miniatura y nombre. Clic para seleccionar, **arrastrar para cambiar el orden**, doble clic para renombrar, **ojo** para ocultar (no se ve ni se exporta) y **candado** para bloquear (no se puede seleccionar ni mover desde el lienzo, ideal para fondos). Botones para subir, bajar, duplicar, ocultar, bloquear y eliminar, y la opción «Solo este slide» para cuando hay muchos objetos.
 - Color de fondo, orden de capas, duplicar, deshacer/rehacer (un arrastre de deslizador o una edición de texto cuentan como un solo paso).
 - Avisa antes de cerrar, abrir otro proyecto o empezar uno nuevo si hay cambios sin guardar.
 - Proyectos guardables (`.carrusel`, JSON con rutas a tus fotos).
@@ -87,6 +92,9 @@ La app queda en `dist/Carrusel.app`. Para ponerle icono, deja un `icon.png` de 1
 - `src/vector.rs` — emojis, formas y marcos como SVG (dibujados con resvg).
 - `src/video.rs` — videos con ffmpeg: información, reproducción y codificación MP4.
 - `src/library.rs` — panel de la biblioteca.
+- `src/layers.rs` — panel de capas (orden, visibilidad, bloqueo, nombres).
+- `src/scrapbook.rs` — colección propia de stickers scrapbook (SVG generados).
+- `src/online.rs` — Iconify y FreeSVG (búsqueda, descarga y caché en `~/Library/Caches/Carrusel`).
 - `src/main.rs` — interfaz, lienzo e interacción.
 - `assets/emoji.tsv` y `assets/emoji_noto.zlib` — biblioteca de emojis (Twemoji y Noto), generada con `tools/build_emoji.py`.
 
@@ -98,4 +106,6 @@ Plantillas de cuadrícula/collage, rotación, contorno en el texto, música de f
 
 - Emojis: [Twemoji](https://github.com/jdecked/twemoji) © Twitter, Inc. y colaboradores, licencia [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 - Emojis: [Google Noto Emoji](https://github.com/googlefonts/noto-emoji) © Google, licencia [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0); banderas de [region-flags](https://github.com/googlefonts/noto-emoji/tree/main/third_party/region-flags), de dominio público.
+- Iconos: [Iconify](https://iconify.design); cada colección tiene su propia licencia, indicada en el inspector.
+- Ilustraciones: [FreeSVG.org](https://freesvg.org), dominio público (CC0).
 - Nombres de emojis en español: [Unicode CLDR](https://cldr.unicode.org), licencia [Unicode](https://www.unicode.org/license.txt).

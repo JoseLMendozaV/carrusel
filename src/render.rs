@@ -257,7 +257,7 @@ fn draw_layer(canvas: &mut RgbaImage, l: &Layer, images: &HashMap<PathBuf, Arc<R
             }
         }
         Kind::Text { .. } => draw_text(canvas, font, l),
-        Kind::Emoji { .. } | Kind::Shape { .. } | Kind::Frame { .. } => draw_vector(canvas, l),
+        Kind::Emoji { .. } | Kind::Shape { .. } | Kind::Frame { .. } | Kind::Graphic { .. } => draw_vector(canvas, l),
     }
 }
 
@@ -277,7 +277,7 @@ fn render_layers<'a>(
     let fill = if background { Rgba(doc.background) } else { Rgba([0, 0, 0, 0]) };
     let mut canvas = RgbaImage::from_pixel(w, ch as u32, fill);
     let x1 = x0 + w as f32;
-    for layer in layers {
+    for layer in layers.into_iter().filter(|l| !l.hidden) {
         // Lo que no toca esta franja se salta (los textos pueden sobresalir
         // un poco de su caja, así que siempre se dibujan).
         let text = matches!(layer.kind, Kind::Text { .. });
@@ -338,7 +338,7 @@ fn save_image(img: RgbaImage, path: &Path, format: ExportFormat) -> Result<(), S
 
 /// Capas de video que tocan la franja `[x0, x0 + w)`.
 fn videos_in(doc: &Doc, x0: f32, w: f32) -> Vec<&Layer> {
-    doc.layers.iter().filter(|l| l.is_video() && l.x < x0 + w && l.x + l.w > x0).collect()
+    doc.layers.iter().filter(|l| l.is_video() && !l.hidden && l.x < x0 + w && l.x + l.w > x0).collect()
 }
 
 /// Tamaño al que se decodifica un video: el de la foto entera en el lienzo.
@@ -571,7 +571,7 @@ pub fn export_scroll_video(
     let hold = seconds_per_slide.max(0.5);
     let n = doc.slides;
     let duration = n as f32 * hold + (n - 1) as f32 * TRANSITION;
-    let vids: Vec<&Layer> = doc.layers.iter().filter(|l| l.is_video()).collect();
+    let vids: Vec<&Layer> = doc.layers.iter().filter(|l| l.is_video() && !l.hidden).collect();
     let audio = pick_audio(&vids, duration, true);
     let mut comp = Compositor::new(doc, images, font, vids)?;
     let mut enc = video::Encoder::new(out, (ow, oh), duration, audio.as_ref())?;
@@ -873,6 +873,17 @@ mod tests {
         }
         let img = render_canvas(&doc, &images, &f);
         img.save(out.join("muestra.png")).unwrap();
+    }
+
+    #[test]
+    fn capas_ocultas_no_se_exportan() {
+        let mut doc = Doc { format: Format::Square, slides: 1, background: [255, 255, 255, 255], ..Default::default() };
+        let mut star = Layer::new(1, Kind::Shape { shape: crate::doc::ShapeKind::Rect, fill: [255, 0, 0, 255], stroke: [0; 4], stroke_w: 0.0 }, (0.0, 0.0, 1080.0, 1080.0));
+        doc.layers.push(star.clone());
+        assert_eq!(render_region(&doc, &HashMap::new(), &font(), 0.0, 1080).get_pixel(540, 540).0, [255, 0, 0, 255]);
+        star.hidden = true;
+        doc.layers[0] = star;
+        assert_eq!(render_region(&doc, &HashMap::new(), &font(), 0.0, 1080).get_pixel(540, 540).0, [255, 255, 255, 255]);
     }
 
     #[test]

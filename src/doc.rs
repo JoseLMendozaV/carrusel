@@ -243,6 +243,19 @@ pub enum Kind {
         color: [u8; 4],
         thickness: f32,
     },
+    /// Icono (Iconify), ilustración (FreeSVG) o sticker scrapbook. El SVG va
+    /// guardado en el proyecto para que funcione sin conexión.
+    Graphic {
+        svg: String,
+        /// De dónde viene, p. ej. «iconify:mdi:heart», «freesvg:123», «scrapbook:cinta-rayas».
+        source: String,
+        name: String,
+        /// Color de los iconos de un solo color (los que usan `currentColor`).
+        #[serde(default)]
+        tint: Option<[u8; 4]>,
+        #[serde(default)]
+        sticker: bool,
+    },
 }
 
 impl Kind {
@@ -255,6 +268,9 @@ impl Kind {
             Kind::Emoji { .. } => "Emoji",
             Kind::Shape { .. } => "Forma",
             Kind::Frame { .. } => "Marco",
+            Kind::Graphic { source, .. } if source.starts_with("iconify:") => "Icono",
+            Kind::Graphic { source, .. } if source.starts_with("freesvg:") => "Ilustración",
+            Kind::Graphic { .. } => "Sticker",
         }
     }
 }
@@ -282,6 +298,15 @@ pub struct Layer {
     pub border: f32,
     #[serde(default = "white")]
     pub border_color: [u8; 4],
+    /// Oculta: no se ve en el editor ni se exporta.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Bloqueada: no se puede seleccionar ni mover desde el lienzo.
+    #[serde(default)]
+    pub locked: bool,
+    /// Nombre elegido en el panel de capas (si no, se usa uno automático).
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn white() -> [u8; 4] {
@@ -290,7 +315,22 @@ fn white() -> [u8; 4] {
 
 impl Layer {
     pub fn new(id: u64, kind: Kind, (x, y, w, h): (f32, f32, f32, f32)) -> Self {
-        Self { id, kind, x, y, w, h, opacity: 1.0, radius: 0.0, crop: Crop::FULL, border: 0.0, border_color: white() }
+        Self {
+            id,
+            kind,
+            x,
+            y,
+            w,
+            h,
+            opacity: 1.0,
+            radius: 0.0,
+            crop: Crop::FULL,
+            border: 0.0,
+            border_color: white(),
+            hidden: false,
+            locked: false,
+            name: None,
+        }
     }
 
     /// Mueve un lado de una forma o marco hasta `to`, estirándolo.
@@ -625,6 +665,7 @@ mod tests {
         assert_eq!(d.layers[0].radius, 0.0);
         assert!(d.layers[0].crop.is_full());
         assert_eq!(d.layers[0].border, 0.0);
+        assert!(!d.layers[0].hidden && !d.layers[0].locked && d.layers[0].name.is_none());
         assert!(matches!(d.layers[0].kind, Kind::Text { background: None, shadow: false, .. }));
         assert!(matches!(d.layers[0].kind, Kind::Text { align: TextAlign::Left, .. }));
     }
