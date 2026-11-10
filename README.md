@@ -36,6 +36,12 @@ Trabajas sobre **un lienzo continuo** dividido en slides. Lo que cruce la línea
   - **Carrusel**: un archivo por slide; los slides con video salen como **MP4** (H.264 + AAC, 30 fps, hasta 60 s, con el sonido del video) y el resto como foto.
   - **Video 9:16** (1080×1920, para Reels y TikTok): un solo MP4 que recorre el carrusel deslizándose de slide en slide; eliges cuántos segundos se queda cada uno.
 
+## Actualizaciones
+
+Carrusel mira una vez al día si hay un release nuevo en GitHub (también con «Buscar actualizaciones», en el panel derecho cuando no hay nada seleccionado). Si lo hay, muestra una barra con las novedades y el botón **Actualizar**: descarga el `.zip`, comprueba su huella SHA-256 y la firma de la app, y la cambia por la nueva al reiniciar (o al cerrar la app). Si Carrusel no está en una carpeta donde pueda escribir, abre la página del release para descargarla a mano.
+
+Para publicar una versión: sube `version` en `Cargo.toml`, compila con `./build_mac.sh universal` y crea el release con el `.zip` llamado `Carrusel-<versión>-macOS.zip`.
+
 ## Requisitos
 
 Instala Rust si no lo tienes:
@@ -93,6 +99,7 @@ La app queda en `dist/Carrusel.app`. Para ponerle icono, deja un `icon.png` de 1
 - `src/video.rs` — videos con ffmpeg: información, reproducción y codificación MP4.
 - `src/library.rs` — panel de la biblioteca.
 - `src/layers.rs` — panel de capas (orden, visibilidad, bloqueo, nombres).
+- `src/updater.rs` — actualizaciones desde los releases de GitHub.
 - `src/scrapbook.rs` — colección propia de stickers scrapbook (SVG generados).
 - `src/online.rs` — Iconify y FreeSVG (búsqueda, descarga y caché en `~/Library/Caches/Carrusel`).
 - `src/main.rs` — interfaz, lienzo e interacción.

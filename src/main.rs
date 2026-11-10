@@ -6,6 +6,7 @@ mod library;
 mod online;
 mod render;
 mod scrapbook;
+mod updater;
 mod vector;
 mod video;
 
@@ -46,6 +47,24 @@ const ZOOM_MAX: f32 = 2.0;
 enum ExportMsg {
     Progress(f32),
     Done(Result<String, String>),
+}
+
+/// Estado de las actualizaciones (ver `updater`).
+enum Update {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(updater::Release),
+    Downloading { release: updater::Release, progress: f32 },
+    /// Descargada y verificada: se instala al reiniciar (o al cerrar la app).
+    Ready { release: updater::Release, app: PathBuf },
+    Failed(String),
+}
+
+enum UpdateMsg {
+    Checked { manual: bool, result: Result<updater::Release, String> },
+    Progress(f32),
+    Downloaded(Result<PathBuf, String>),
 }
 
 /// Qué se exporta.
@@ -183,6 +202,10 @@ struct App {
     export_panorama: bool,
     export_target: ExportTarget,
     scroll_seconds: f32,
+    update: Update,
+    update_tx: mpsc::Sender<UpdateMsg>,
+    update_rx: mpsc::Receiver<UpdateMsg>,
+    show_update_notes: bool,
     exporting: Option<mpsc::Receiver<ExportMsg>>,
     status: String,
 }
@@ -195,6 +218,7 @@ impl App {
         cc.egui_ctx.set_visuals(visuals);
 
         let (load_tx, load_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::channel();
         let mut app = Self {
             doc: Doc::default(),
             path: None,
@@ -231,11 +255,155 @@ impl App {
             export_panorama: false,
             export_target: ExportTarget::Carousel,
             scroll_seconds: 2.5,
+            update: Update::Idle,
+            update_tx,
+            update_rx,
+            show_update_notes: false,
             exporting: None,
             status: "Arrastra fotos o videos a la ventana, o usa «＋ Fotos / videos».".into(),
         };
         app.sync_font(&cc.egui_ctx);
+        // Una vez al día, en segundo plano, mira si hay una versión nueva.
+        if updater::due_for_check() {
+            app.check_updates(&cc.egui_ctx, false);
+        }
         app
+    }
+
+    // ----- actualizaciones -------------------------------------------------
+
+    fn check_updates(&mut self, ctx: &egui::Context, manual: bool) {
+        if matches!(self.update, Update::Checking | Update::Downloading { .. } | Update::Ready { .. }) {
+            return;
+        }
+        self.update = Update::Checking;
+        let (tx, ctx) = (self.update_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = updater::latest();
+            if result.is_ok() {
+                updater::mark_checked();
+            }
+            let _ = tx.send(UpdateMsg::Checked { manual, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_update_download(&mut self, ctx: &egui::Context, release: updater::Release) {
+        // Sin paquete .app (p. ej. con `cargo run`) o sin permiso para
+        // reemplazarlo, se descarga a mano desde GitHub.
+        match updater::current_bundle() {
+            Some(bundle) if updater::can_replace(&bundle) => {}
+            _ => {
+                ctx.open_url(egui::OpenUrl::new_tab(&release.page));
+                self.status = "Descarga la versión nueva desde la página de GitHub que se acaba de abrir.".into();
+                self.update = Update::Idle;
+                return;
+            }
+        }
+        self.update = Update::Downloading { release: release.clone(), progress: 0.0 };
+        let (tx, ctx) = (self.update_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let progress_ctx = ctx.clone();
+            let result = updater::download(&release, &move |f| {
+                let _ = progress_tx.send(UpdateMsg::Progress(f));
+                progress_ctx.request_repaint();
+            });
+            let _ = tx.send(UpdateMsg::Downloaded(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_updates(&mut self) {
+        while let Ok(msg) = self.update_rx.try_recv() {
+            self.update = match (msg, std::mem::replace(&mut self.update, Update::Idle)) {
+                (UpdateMsg::Checked { manual, result: Ok(r) }, _) => {
+                    if updater::is_newer(&r.version, updater::current_version()) {
+                        Update::Available(r)
+                    } else if manual {
+                        Update::UpToDate
+                    } else {
+                        Update::Idle
+                    }
+                }
+                (UpdateMsg::Checked { manual: true, result: Err(e) }, _) => Update::Failed(e),
+                (UpdateMsg::Checked { manual: false, result: Err(_) }, _) => Update::Idle,
+                (UpdateMsg::Progress(p), Update::Downloading { release, .. }) => Update::Downloading { release, progress: p },
+                (UpdateMsg::Downloaded(Ok(app)), Update::Downloading { release, .. }) => Update::Ready { release, app },
+                (UpdateMsg::Downloaded(Err(e)), _) => Update::Failed(e),
+                (_, state) => state,
+            };
+        }
+    }
+
+    /// Prepara el cambio de versión para cuando la app se cierre.
+    fn schedule_install(&mut self, relaunch: bool) -> bool {
+        let Update::Ready { app, .. } = &self.update else { return false };
+        let Some(bundle) = updater::current_bundle() else { return false };
+        match updater::install_on_exit(app, &bundle, std::process::id(), relaunch) {
+            Ok(()) => true,
+            Err(e) => {
+                self.update = Update::Failed(e);
+                false
+            }
+        }
+    }
+
+    fn restart_to_update(&mut self, ctx: &egui::Context) {
+        if !self.confirm_discard() {
+            return;
+        }
+        if self.schedule_install(true) {
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Barra superior que avisa de una versión nueva.
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let current = updater::current_version();
+        ui.horizontal_wrapped(|ui| match &self.update {
+            Update::Available(r) => {
+                let r = r.clone();
+                ui.label(egui::RichText::new(format!("Hay una versión nueva de Carrusel: {} (tienes {current}).", r.version)).strong());
+                if ui.add(egui::Button::new(egui::RichText::new("Actualizar").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                    self.start_update_download(&ctx, r);
+                }
+                ui.toggle_value(&mut self.show_update_notes, "Novedades");
+                if ui.button("Ahora no").clicked() {
+                    self.update = Update::Idle;
+                }
+            }
+            Update::Downloading { release, progress } => {
+                ui.label(format!("Descargando Carrusel {}…", release.version));
+                ui.add(egui::ProgressBar::new(*progress).desired_width(220.0).show_percentage());
+            }
+            Update::Ready { release, .. } => {
+                let version = release.version.clone();
+                ui.label(egui::RichText::new(format!("Carrusel {version} está descargada y verificada.")).strong());
+                if ui.add(egui::Button::new(egui::RichText::new("Reiniciar ahora").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                    self.restart_to_update(&ctx);
+                }
+                ui.weak("o se instalará sola al cerrar la app.");
+            }
+            Update::Failed(e) => {
+                ui.colored_label(Color32::from_rgb(255, 150, 150), format!("No se pudo actualizar: {e}"));
+                if ui.button("Abrir GitHub").clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(updater::RELEASES_PAGE));
+                }
+                if ui.button("Cerrar").clicked() {
+                    self.update = Update::Idle;
+                }
+            }
+            _ => {}
+        });
+        if let (Update::Available(r), true) = (&self.update, self.show_update_notes) {
+            let notes = r.notes.split("\n---").next().unwrap_or("").trim().to_string();
+            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                ui.label(notes);
+            });
+        }
     }
 
     // ----- historial -------------------------------------------------------
@@ -1105,6 +1273,23 @@ impl App {
                     ui.weak(v);
                 });
             }
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new(format!("Carrusel {}", updater::current_version())).strong());
+            ui.horizontal(|ui| {
+                let busy = matches!(self.update, Update::Checking | Update::Downloading { .. });
+                if ui.add_enabled(!busy, egui::Button::new("Buscar actualizaciones")).clicked() {
+                    self.check_updates(&ctx, true);
+                }
+                match &self.update {
+                    Update::Checking => {
+                        ui.spinner();
+                    }
+                    Update::UpToDate => {
+                        ui.weak("Tienes la última versión.");
+                    }
+                    _ => {}
+                }
+            });
             return;
         };
 
@@ -2099,10 +2284,13 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.confirm_discard() {
                 self.allow_close = true;
+                // Una actualización ya descargada se instala al cerrar.
+                self.schedule_install(false);
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
+        self.poll_updates();
 
         // Cuando no se arrastra ningún control ni se escribe, termina el gesto
         // y el siguiente cambio vuelve a ser un paso de deshacer nuevo.
@@ -2125,6 +2313,11 @@ impl eframe::App for App {
             self.toolbar(ui);
             ui.add_space(4.0);
         });
+        if matches!(self.update, Update::Available(_) | Update::Downloading { .. } | Update::Ready { .. } | Update::Failed(_)) {
+            egui::Panel::top("update")
+                .frame(egui::Frame::new().fill(Color32::from_rgb(52, 36, 46)).inner_margin(egui::Margin::symmetric(10, 6)))
+                .show(ui, |ui| self.update_banner(ui));
+        }
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.pending > 0 || self.exporting.is_some() {
