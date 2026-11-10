@@ -110,16 +110,153 @@ impl Format {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShapeKind {
+    Rect,
+    RoundRect,
+    Ellipse,
+    Triangle,
+    Star,
+    Heart,
+    Arrow,
+    Line,
+    Bubble,
+    Burst,
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 10] = [
+        ShapeKind::Rect,
+        ShapeKind::RoundRect,
+        ShapeKind::Ellipse,
+        ShapeKind::Triangle,
+        ShapeKind::Star,
+        ShapeKind::Heart,
+        ShapeKind::Arrow,
+        ShapeKind::Line,
+        ShapeKind::Bubble,
+        ShapeKind::Burst,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Rect => "Rectángulo",
+            ShapeKind::RoundRect => "Redondeado",
+            ShapeKind::Ellipse => "Círculo",
+            ShapeKind::Triangle => "Triángulo",
+            ShapeKind::Star => "Estrella",
+            ShapeKind::Heart => "Corazón",
+            ShapeKind::Arrow => "Flecha",
+            ShapeKind::Line => "Línea",
+            ShapeKind::Bubble => "Bocadillo",
+            ShapeKind::Burst => "Estallido",
+        }
+    }
+}
+
+/// Diseño de los emojis: Twemoji (plano) o Google Noto (con degradados).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EmojiStyle {
+    #[default]
+    Twemoji,
+    Noto,
+}
+
+impl EmojiStyle {
+    pub const ALL: [EmojiStyle; 2] = [EmojiStyle::Twemoji, EmojiStyle::Noto];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EmojiStyle::Twemoji => "Twemoji",
+            EmojiStyle::Noto => "Google Noto",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameKind {
+    Simple,
+    Double,
+    Polaroid,
+    Film,
+    Corners,
+    Dashed,
+}
+
+impl FrameKind {
+    pub const ALL: [FrameKind; 6] =
+        [FrameKind::Simple, FrameKind::Double, FrameKind::Polaroid, FrameKind::Film, FrameKind::Corners, FrameKind::Dashed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameKind::Simple => "Simple",
+            FrameKind::Double => "Doble línea",
+            FrameKind::Polaroid => "Polaroid",
+            FrameKind::Film => "Película",
+            FrameKind::Corners => "Esquinas",
+            FrameKind::Dashed => "Discontinuo",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Kind {
-    Image { path: PathBuf },
+    Image {
+        path: PathBuf,
+    },
     Text {
         text: String,
         size: f32,
         color: [u8; 4],
         #[serde(default)]
         align: TextAlign,
+        /// Recuadro detrás del texto (estilo Instagram).
+        #[serde(default)]
+        background: Option<[u8; 4]>,
+        #[serde(default)]
+        shadow: bool,
     },
+    Video {
+        path: PathBuf,
+        /// Segundo del video en el que empieza.
+        #[serde(default)]
+        start: f32,
+        #[serde(default)]
+        muted: bool,
+    },
+    /// Emoji de la biblioteca; con `sticker` lleva borde blanco y sombra de calcomanía.
+    Emoji {
+        emoji: String,
+        #[serde(default)]
+        sticker: bool,
+        #[serde(default)]
+        style: EmojiStyle,
+    },
+    Shape {
+        shape: ShapeKind,
+        fill: [u8; 4],
+        stroke: [u8; 4],
+        stroke_w: f32,
+    },
+    Frame {
+        frame: FrameKind,
+        color: [u8; 4],
+        thickness: f32,
+    },
+}
+
+impl Kind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Kind::Image { .. } => "Foto",
+            Kind::Text { .. } => "Texto",
+            Kind::Video { .. } => "Video",
+            Kind::Emoji { sticker: true, .. } => "Calcomanía",
+            Kind::Emoji { .. } => "Emoji",
+            Kind::Shape { .. } => "Forma",
+            Kind::Frame { .. } => "Marco",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -140,11 +277,37 @@ pub struct Layer {
     /// Qué parte de la foto se ve dentro del marco (x, y, w, h).
     #[serde(default)]
     pub crop: Crop,
+    /// Marco alrededor de una foto o video, en píxeles del lienzo (0 = sin marco).
+    #[serde(default)]
+    pub border: f32,
+    #[serde(default = "white")]
+    pub border_color: [u8; 4],
+}
+
+fn white() -> [u8; 4] {
+    [255, 255, 255, 255]
 }
 
 impl Layer {
     pub fn new(id: u64, kind: Kind, (x, y, w, h): (f32, f32, f32, f32)) -> Self {
-        Self { id, kind, x, y, w, h, opacity: 1.0, radius: 0.0, crop: Crop::FULL }
+        Self { id, kind, x, y, w, h, opacity: 1.0, radius: 0.0, crop: Crop::FULL, border: 0.0, border_color: white() }
+    }
+
+    /// Mueve un lado de una forma o marco hasta `to`, estirándolo.
+    pub fn stretch_edge(&mut self, edge: Edge, to: f32) {
+        let (right, bottom) = (self.x + self.w, self.y + self.h);
+        match edge {
+            Edge::Left => {
+                self.x = to.min(right - MIN_CROP);
+                self.w = right - self.x;
+            }
+            Edge::Right => self.w = (to - self.x).max(MIN_CROP),
+            Edge::Top => {
+                self.y = to.min(bottom - MIN_CROP);
+                self.h = bottom - self.y;
+            }
+            Edge::Bottom => self.h = (to - self.y).max(MIN_CROP),
+        }
     }
 
     /// Rectángulo que ocuparía la foto entera sin recortar, en el lienzo.
@@ -215,6 +378,17 @@ impl Layer {
     }
     pub fn is_image(&self) -> bool {
         matches!(self.kind, Kind::Image { .. })
+    }
+    pub fn is_video(&self) -> bool {
+        matches!(self.kind, Kind::Video { .. })
+    }
+    /// Foto o video: se pueden recortar, mover dentro del recorte y llevar marco.
+    pub fn is_media(&self) -> bool {
+        self.is_image() || self.is_video()
+    }
+    /// Formas y marcos: se estiran libremente (sin mantener la proporción).
+    pub fn is_stretchy(&self) -> bool {
+        matches!(self.kind, Kind::Shape { .. } | Kind::Frame { .. })
     }
 }
 
@@ -450,6 +624,8 @@ mod tests {
         assert_eq!(d.layers[0].opacity, 1.0);
         assert_eq!(d.layers[0].radius, 0.0);
         assert!(d.layers[0].crop.is_full());
+        assert_eq!(d.layers[0].border, 0.0);
+        assert!(matches!(d.layers[0].kind, Kind::Text { background: None, shadow: false, .. }));
         assert!(matches!(d.layers[0].kind, Kind::Text { align: TextAlign::Left, .. }));
     }
 }

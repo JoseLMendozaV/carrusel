@@ -1,10 +1,13 @@
 //! Carrusel — creador de carruseles panorámicos para Instagram (estilo SCRL).
 
 mod doc;
+mod library;
 mod render;
+mod vector;
+mod video;
 
 use ab_glyph::FontArc;
-use doc::{fit, Crop, Doc, Edge, Format, Kind, Layer, TextAlign, INSTAGRAM_MAX, LINE_H};
+use doc::{fit, Crop, Doc, Edge, Format, FrameKind, Kind, Layer, ShapeKind, TextAlign, INSTAGRAM_MAX, LINE_H};
 use eframe::egui::{
     self, epaint::RectShape, Align2, Color32, CornerRadius, FontFamily, FontId, Key, KeyboardShortcut, Modifiers,
     Pos2, Rect, Sense, Shape, Stroke, StrokeKind, TextureHandle, Vec2,
@@ -16,6 +19,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
 const IMAGE_EXT: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
+/// Texto que añade el botón «＋ Texto».
+const DEFAULT_TEXT: library::TextPreset = library::TextPreset {
+    label: "Texto",
+    text: "Tu texto",
+    size: 96.0,
+    color: [20, 20, 20, 255],
+    align: TextAlign::Center,
+    background: None,
+    shadow: false,
+};
+
+fn is_supported(path: &Path) -> bool {
+    video::is_video(path)
+        || path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXT.contains(&e.to_lowercase().as_str()))
+}
 const ACCENT: Color32 = Color32::from_rgb(255, 64, 129);
 const CANVAS_FONT: &str = "canvas";
 /// Límites del zoom; el mínimo es muy pequeño para poder ver carruseles larguísimos.
@@ -23,8 +41,17 @@ const ZOOM_MIN: f32 = 0.002;
 const ZOOM_MAX: f32 = 2.0;
 
 enum ExportMsg {
-    Progress(u32, u32),
-    Done(Result<(render::ExportReport, PathBuf), String>),
+    Progress(f32),
+    Done(Result<String, String>),
+}
+
+/// Qué se exporta.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportTarget {
+    /// Un archivo por slide: foto (JPG/PNG) o video MP4 si el slide tiene video.
+    Carousel,
+    /// Un único video vertical 9:16 que recorre el carrusel (Reels / TikTok).
+    ScrollVideo,
 }
 
 fn main() -> eframe::Result {
@@ -58,10 +85,27 @@ enum Place {
     At(f32, f32),
 }
 
+enum LoadedData {
+    Image(RgbaImage, egui::ColorImage),
+    /// Información del video y su primer fotograma.
+    Video(video::VideoInfo, egui::ColorImage),
+}
+
 struct LoadMsg {
     path: PathBuf,
     place: Place,
-    result: Result<(RgbaImage, egui::ColorImage), String>,
+    result: Result<LoadedData, String>,
+}
+
+struct VideoEntry {
+    info: video::VideoInfo,
+    poster: TextureHandle,
+}
+
+/// Textura de una capa vectorial, con la clave de lo que contiene.
+struct VectorTex {
+    key: u64,
+    tex: TextureHandle,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -72,6 +116,8 @@ enum DragMode {
     Crop(Edge),
     /// Mover la foto dentro de su recorte (⌘ + arrastrar).
     Pan,
+    /// Estirar un lado de una forma o un marco.
+    Stretch(Edge),
 }
 
 struct Drag {
@@ -104,6 +150,15 @@ struct App {
     menu_slide: u32,
 
     images: HashMap<PathBuf, Loaded>,
+    videos: HashMap<PathBuf, VideoEntry>,
+    /// Reproductores de video del editor y su último fotograma, por capa.
+    players: HashMap<u64, video::Player>,
+    video_tex: HashMap<u64, TextureHandle>,
+    play_videos: bool,
+    vector_tex: HashMap<u64, VectorTex>,
+    library: library::Library,
+    /// Slide donde se colocan los elementos nuevos (el último en el que se hizo clic).
+    focus_slide: u32,
     failed: HashMap<PathBuf, String>,
     pending: usize,
     load_tx: mpsc::Sender<LoadMsg>,
@@ -122,6 +177,8 @@ struct App {
 
     export_format: ExportFormat,
     export_panorama: bool,
+    export_target: ExportTarget,
+    scroll_seconds: f32,
     exporting: Option<mpsc::Receiver<ExportMsg>>,
     status: String,
 }
@@ -145,6 +202,13 @@ impl App {
             preview: None,
             menu_slide: 0,
             images: HashMap::new(),
+            videos: HashMap::new(),
+            players: HashMap::new(),
+            video_tex: HashMap::new(),
+            play_videos: true,
+            vector_tex: HashMap::new(),
+            library: library::Library::default(),
+            focus_slide: 0,
             failed: HashMap::new(),
             pending: 0,
             load_tx,
@@ -160,8 +224,10 @@ impl App {
             span: 1,
             export_format: ExportFormat::Jpg,
             export_panorama: false,
+            export_target: ExportTarget::Carousel,
+            scroll_seconds: 2.5,
             exporting: None,
-            status: "Arrastra fotos a la ventana o usa «＋ Fotos».".into(),
+            status: "Arrastra fotos o videos a la ventana, o usa «＋ Fotos / videos».".into(),
         };
         app.sync_font(&cc.egui_ctx);
         app
@@ -290,26 +356,35 @@ impl App {
     // ----- imágenes --------------------------------------------------------
 
     fn request_load(&mut self, path: PathBuf, place: Place, ctx: &egui::Context) {
-        if self.images.contains_key(&path) {
-            self.place_image(&path, place);
+        if self.images.contains_key(&path) || self.videos.contains_key(&path) {
+            self.place_media(&path, place);
             return;
         }
         self.pending += 1;
         let tx = self.load_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = render::load_image(&path).map(|full| {
-                // Textura de vista previa (máx. 2048 px); la original se usa al exportar.
-                let s = (2048.0 / full.width().max(full.height()) as f32).min(1.0);
-                let tw = ((full.width() as f32 * s) as u32).max(1);
-                let th = ((full.height() as f32 * s) as u32).max(1);
-                let thumb = if s < 1.0 { image::imageops::thumbnail(&full, tw, th) } else { full.clone() };
-                let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [thumb.width() as usize, thumb.height() as usize],
-                    thumb.as_raw(),
-                );
-                (full, color)
-            });
+            let result = if video::is_video(&path) {
+                video::probe(&path).and_then(|info| {
+                    let size = video::fit_size(&info, 640);
+                    let poster = video::frame_at(&path, 0.0, size)?;
+                    let color = egui::ColorImage::from_rgba_unmultiplied([size.0 as usize, size.1 as usize], poster.as_raw());
+                    Ok(LoadedData::Video(info, color))
+                })
+            } else {
+                render::load_image(&path).map(|full| {
+                    // Textura de vista previa (máx. 2048 px); la original se usa al exportar.
+                    let s = (2048.0 / full.width().max(full.height()) as f32).min(1.0);
+                    let tw = ((full.width() as f32 * s) as u32).max(1);
+                    let th = ((full.height() as f32 * s) as u32).max(1);
+                    let thumb = if s < 1.0 { image::imageops::thumbnail(&full, tw, th) } else { full.clone() };
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [thumb.width() as usize, thumb.height() as usize],
+                        thumb.as_raw(),
+                    );
+                    LoadedData::Image(full, color)
+                })
+            };
             let _ = tx.send(LoadMsg { path, place, result });
             ctx.request_repaint();
         });
@@ -318,24 +393,35 @@ impl App {
     fn receive_loads(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.load_rx.try_recv() {
             self.pending = self.pending.saturating_sub(1);
+            let name = msg.path.display().to_string();
             match msg.result {
-                Ok((full, color)) => {
+                Ok(LoadedData::Image(full, color)) => {
                     let aspect = full.width() as f32 / full.height() as f32;
-                    let tex = ctx.load_texture(msg.path.display().to_string(), color, egui::TextureOptions::LINEAR);
+                    let tex = ctx.load_texture(name, color, egui::TextureOptions::LINEAR);
                     self.images.insert(msg.path.clone(), Loaded { full: Arc::new(full), tex, aspect });
-                    self.failed.remove(&msg.path);
-                    self.place_image(&msg.path, msg.place);
+                }
+                Ok(LoadedData::Video(info, color)) => {
+                    let poster = ctx.load_texture(name, color, egui::TextureOptions::LINEAR);
+                    self.videos.insert(msg.path.clone(), VideoEntry { info, poster });
                 }
                 Err(e) => {
                     self.status = format!("No se pudo abrir {e}");
                     self.failed.insert(msg.path, e);
+                    continue;
                 }
             }
+            self.failed.remove(&msg.path);
+            self.place_media(&msg.path, msg.place);
         }
     }
 
-    fn place_image(&mut self, path: &Path, place: Place) {
-        let Some(aspect) = self.images.get(path).map(|l| l.aspect) else { return };
+    /// Proporción (ancho / alto) de una foto o video ya cargado.
+    fn media_aspect(&self, path: &Path) -> Option<f32> {
+        self.images.get(path).map(|l| l.aspect).or_else(|| self.videos.get(path).map(|v| v.info.aspect()))
+    }
+
+    fn place_media(&mut self, path: &Path, place: Place) {
+        let Some(aspect) = self.media_aspect(path) else { return };
         let (x, y, w, h) = match place {
             Place::Cache => return,
             Place::Slide(i) => {
@@ -351,7 +437,12 @@ impl App {
             }
         };
         let id = self.doc.new_id();
-        let mut layer = Layer::new(id, Kind::Image { path: path.to_path_buf() }, (x, y, w, h));
+        let kind = if self.videos.contains_key(path) {
+            Kind::Video { path: path.to_path_buf(), start: 0.0, muted: false }
+        } else {
+            Kind::Image { path: path.to_path_buf() }
+        };
+        let mut layer = Layer::new(id, kind, (x, y, w, h));
         if let Place::Slide(_) = place {
             // Llena el slide justo, sin invadir los de al lado.
             layer.set_cover(aspect, (x, y, w, h));
@@ -360,32 +451,80 @@ impl App {
         self.selected = Some(id);
     }
 
-    fn add_photos(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
-        let mut next = self.doc.layers.iter().filter(|l| l.is_image()).count() as u32;
+    /// Fotos y videos nuevos: uno por slide a partir del primero libre.
+    fn add_media(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        let mut next = self.doc.layers.iter().filter(|l| l.is_media()).count() as u32;
         for p in paths {
+            if video::is_video(&p) && video::ffmpeg().is_none() {
+                self.status = video::MISSING.into();
+                continue;
+            }
             self.request_load(p, Place::Slide(next), ctx);
             next += 1;
         }
     }
 
-    fn add_text(&mut self) {
-        self.checkpoint();
-        let (sw, sh) = self.doc.slide_size();
-        let slide = self
-            .selected
+    /// Slide donde van los elementos nuevos: el de la capa seleccionada o el
+    /// último en el que se hizo clic.
+    fn current_slide(&self) -> u32 {
+        self.selected
             .and_then(|id| self.doc.layers.iter().find(|l| l.id == id))
             .map(|l| self.doc.slide_of(l))
-            .unwrap_or(0);
-        let text = "Tu texto".to_string();
-        let size = 96.0;
-        let (w, h) = render::measure_text(&self.font, &text, size);
+            .unwrap_or(self.focus_slide)
+            .min(self.doc.slides - 1)
+    }
+
+    /// Añade una capa centrada en el slide actual y la selecciona.
+    fn add_centered(&mut self, kind: Kind, w: f32, h: f32) {
+        self.checkpoint();
+        let (sw, sh) = self.doc.slide_size();
+        let slide = self.current_slide();
         let id = self.doc.new_id();
-        self.doc.layers.push(Layer::new(
-            id,
-            Kind::Text { text, size, color: [20, 20, 20, 255], align: TextAlign::Center },
-            (slide as f32 * sw + (sw - w) / 2.0, (sh - h) / 2.0, w, h),
-        ));
+        self.doc.layers.push(Layer::new(id, kind, (slide as f32 * sw + (sw - w) / 2.0, (sh - h) / 2.0, w, h)));
         self.selected = Some(id);
+    }
+
+    fn add_text(&mut self, preset: &library::TextPreset) {
+        let (w, h) = render::measure_text(&self.font, preset.text, preset.size);
+        let kind = Kind::Text {
+            text: preset.text.into(),
+            size: preset.size,
+            color: preset.color,
+            align: preset.align,
+            background: preset.background,
+            shadow: preset.shadow,
+        };
+        self.add_centered(kind, w, h);
+    }
+
+    fn apply_library(&mut self, action: library::Action) {
+        let (sw, _) = self.doc.slide_size();
+        match action {
+            library::Action::Emoji(emoji, sticker, style) => {
+                let side = sw * 0.35;
+                self.add_centered(Kind::Emoji { emoji: emoji.into(), sticker, style }, side, side);
+            }
+            library::Action::Shape(shape) => {
+                let (w, h) = if shape == ShapeKind::Line { (sw * 0.6, 14.0) } else { (sw * 0.45, sw * 0.45) };
+                let fill = [ACCENT.r(), ACCENT.g(), ACCENT.b(), 255];
+                self.add_centered(Kind::Shape { shape, fill, stroke: [255, 255, 255, 0], stroke_w: 12.0 }, w, h);
+            }
+            library::Action::Frame(frame) => {
+                // Sobre la foto seleccionada, o del tamaño del slide.
+                let target = self
+                    .selected
+                    .and_then(|id| self.doc.layers.iter().find(|l| l.id == id && l.is_media()))
+                    .map(|l| (l.x, l.y, l.w, l.h));
+                let rect = target.unwrap_or_else(|| self.doc.slides_rect(self.current_slide(), 1));
+                let thickness = (rect.2.min(rect.3) * 0.04).max(4.0);
+                self.checkpoint();
+                let id = self.doc.new_id();
+                let kind = Kind::Frame { frame, color: [255, 255, 255, 255], thickness };
+                self.doc.layers.push(Layer::new(id, kind, rect));
+                self.selected = Some(id);
+            }
+            library::Action::Text(preset) => self.add_text(preset),
+        }
     }
 
     /// Recalcula el tamaño de las capas de texto (cambian al editar).
@@ -400,7 +539,7 @@ impl App {
     }
 
     fn distribute(&mut self) {
-        let ids: Vec<u64> = self.doc.layers.iter().filter(|l| l.is_image()).map(|l| l.id).collect();
+        let ids: Vec<u64> = self.doc.layers.iter().filter(|l| l.is_media()).map(|l| l.id).collect();
         if ids.is_empty() {
             return;
         }
@@ -421,7 +560,7 @@ impl App {
             .iter()
             .find(|l| l.id == id)
             .and_then(|l| match &l.kind {
-                Kind::Image { path } => self.images.get(path).map(|i| i.aspect),
+                Kind::Image { path } | Kind::Video { path, .. } => self.media_aspect(path),
                 _ => None,
             })
             .unwrap_or_else(|| {
@@ -541,12 +680,12 @@ impl App {
                     .layers
                     .iter()
                     .filter_map(|l| match &l.kind {
-                        Kind::Image { path } => Some(path.clone()),
+                        Kind::Image { path } | Kind::Video { path, .. } => Some(path.clone()),
                         _ => None,
                     })
                     .collect();
                 for p in paths {
-                    if !self.images.contains_key(&p) {
+                    if !self.images.contains_key(&p) && !self.videos.contains_key(&p) {
                         self.request_load(p, Place::Cache, ctx);
                     }
                 }
@@ -586,26 +725,52 @@ impl App {
             return;
         }
         if self.pending > 0 {
-            self.status = "Espera a que terminen de cargar las fotos.".into();
+            self.status = "Espera a que terminen de cargar las fotos y videos.".into();
             return;
         }
-        let Some(folder) = rfd::FileDialog::new().set_title("Carpeta de exportación").pick_folder() else {
+        let needs_ffmpeg = self.export_target == ExportTarget::ScrollVideo || self.doc.layers.iter().any(|l| l.is_video());
+        if needs_ffmpeg && video::ffmpeg().is_none() {
+            self.status = video::MISSING.into();
             return;
+        }
+        let target = match self.export_target {
+            ExportTarget::Carousel => rfd::FileDialog::new().set_title("Carpeta de exportación").pick_folder(),
+            ExportTarget::ScrollVideo => rfd::FileDialog::new()
+                .set_title("Guardar video 9:16")
+                .add_filter("Video MP4", &["mp4"])
+                .set_file_name(format!("{}-9x16.mp4", self.doc_name()))
+                .save_file(),
         };
+        let Some(target) = target else { return };
         let doc = self.doc.clone();
         let images: HashMap<PathBuf, Arc<RgbaImage>> =
             self.images.iter().map(|(k, v)| (k.clone(), v.full.clone())).collect();
         let font = self.font.clone();
-        let (fmt, pano) = (self.export_format, self.export_panorama);
+        let (kind, fmt, pano, secs) = (self.export_target, self.export_format, self.export_panorama, self.scroll_seconds);
         let (tx, rx) = mpsc::channel();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let progress = |done, total| {
-                let _ = tx.send(ExportMsg::Progress(done, total));
-                repaint.request_repaint();
+            let progress_tx = tx.clone();
+            let progress_ctx = repaint.clone();
+            let progress = move |f: f32| {
+                let _ = progress_tx.send(ExportMsg::Progress(f));
+                progress_ctx.request_repaint();
             };
-            let r = render::export(&doc, &images, &font, &folder, fmt, pano, &progress).map(|n| (n, folder));
-            let _ = tx.send(ExportMsg::Done(r));
+            let result = match kind {
+                ExportTarget::Carousel => render::export(&doc, &images, &font, &target, fmt, pano, &progress).map(|r| {
+                    let mut msg = format!("✔ {} slides exportadas en {}", r.slides, target.display());
+                    if r.videos > 0 {
+                        msg += &format!(" ({} en video MP4)", r.videos);
+                    }
+                    if r.panorama_png {
+                        msg += " · el panorama sale en PNG: es demasiado ancho para JPG";
+                    }
+                    msg
+                }),
+                ExportTarget::ScrollVideo => render::export_scroll_video(&doc, &images, &font, &target, secs, &progress)
+                    .map(|_| format!("✔ Video 9:16 guardado en {}", target.display())),
+            };
+            let _ = tx.send(ExportMsg::Done(result));
             repaint.request_repaint();
         });
         self.exporting = Some(rx);
@@ -616,17 +781,9 @@ impl App {
         let Some(rx) = &self.exporting else { return };
         loop {
             match rx.try_recv() {
-                Ok(ExportMsg::Progress(done, total)) => self.status = format!("Exportando {done}/{total}…"),
-                Ok(ExportMsg::Done(Ok((report, folder)))) => {
-                    self.status = format!("✔ {} slides exportadas en {}", report.slides, folder.display());
-                    if report.panorama_png {
-                        self.status += " (el panorama sale en PNG: es demasiado ancho para JPG)";
-                    }
-                    self.exporting = None;
-                    return;
-                }
-                Ok(ExportMsg::Done(Err(e))) => {
-                    self.status = format!("Error al exportar: {e}");
+                Ok(ExportMsg::Progress(f)) => self.status = format!("Exportando… {:.0} %", f * 100.0),
+                Ok(ExportMsg::Done(result)) => {
+                    self.status = result.unwrap_or_else(|e| format!("Error al exportar: {e}"));
                     self.exporting = None;
                     return;
                 }
@@ -770,13 +927,25 @@ impl App {
                 self.save(false);
             }
             ui.separator();
-            if ui.button("＋ Fotos").clicked() {
-                if let Some(paths) = rfd::FileDialog::new().add_filter("Imágenes", IMAGE_EXT).pick_files() {
-                    self.add_photos(paths, &ctx);
+            if ui.button("＋ Fotos / videos").clicked() {
+                let all: Vec<&str> = IMAGE_EXT.iter().chain(video::VIDEO_EXT).copied().collect();
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("Fotos y videos", &all)
+                    .add_filter("Fotos", IMAGE_EXT)
+                    .add_filter("Videos", video::VIDEO_EXT)
+                    .pick_files()
+                {
+                    self.add_media(paths, &ctx);
                 }
             }
             if ui.button("＋ Texto").clicked() {
-                self.add_text();
+                self.add_text(&DEFAULT_TEXT);
+            }
+            ui.toggle_value(&mut self.library.open, "Biblioteca")
+                .on_hover_text("Emojis, calcomanías, formas, marcos y estilos de texto");
+            if self.doc.layers.iter().any(|l| l.is_video()) {
+                let label = if self.play_videos { "⏸ Videos" } else { "▶ Videos" };
+                ui.toggle_value(&mut self.play_videos, label).on_hover_text("Reproducir los videos en el editor");
             }
             ui.separator();
 
@@ -830,18 +999,38 @@ impl App {
                 self.toggle_preview();
             }
             ui.separator();
-            egui::ComboBox::from_id_salt("exp_fmt")
-                .width(60.0)
-                .selected_text(match self.export_format {
-                    ExportFormat::Jpg => "JPG",
-                    ExportFormat::Png => "PNG",
+            egui::ComboBox::from_id_salt("exp_target")
+                .selected_text(match self.export_target {
+                    ExportTarget::Carousel => "Carrusel",
+                    ExportTarget::ScrollVideo => "Video 9:16",
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.export_format, ExportFormat::Jpg, "JPG");
-                    ui.selectable_value(&mut self.export_format, ExportFormat::Png, "PNG");
+                    ui.selectable_value(&mut self.export_target, ExportTarget::Carousel, "Carrusel (Instagram / TikTok)")
+                        .on_hover_text("Un archivo por slide: foto, o MP4 si el slide tiene video");
+                    ui.selectable_value(&mut self.export_target, ExportTarget::ScrollVideo, "Video 9:16 (Reels / TikTok)")
+                        .on_hover_text("Un solo video vertical 1080×1920 que recorre el carrusel");
                 });
-            ui.checkbox(&mut self.export_panorama, "+ panorama");
-            let label = if self.exporting.is_some() { "Exportando…" } else { "Exportar slides" };
+            match self.export_target {
+                ExportTarget::Carousel => {
+                    egui::ComboBox::from_id_salt("exp_fmt")
+                        .width(60.0)
+                        .selected_text(match self.export_format {
+                            ExportFormat::Jpg => "JPG",
+                            ExportFormat::Png => "PNG",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.export_format, ExportFormat::Jpg, "JPG");
+                            ui.selectable_value(&mut self.export_format, ExportFormat::Png, "PNG");
+                        });
+                    ui.checkbox(&mut self.export_panorama, "+ panorama");
+                }
+                ExportTarget::ScrollVideo => {
+                    ui.add(egui::DragValue::new(&mut self.scroll_seconds).range(0.5..=15.0).speed(0.1).suffix(" s"))
+                        .on_hover_text("Segundos que se queda cada slide antes de deslizarse al siguiente");
+                    ui.weak("por slide");
+                }
+            }
+            let label = if self.exporting.is_some() { "Exportando…" } else { "Exportar" };
             let btn = egui::Button::new(egui::RichText::new(label).strong().color(Color32::WHITE)).fill(ACCENT);
             if ui.add_enabled(self.exporting.is_none(), btn).on_hover_text("⌘E").clicked() {
                 self.start_export(&ctx);
@@ -887,8 +1076,8 @@ impl App {
             ui.label(egui::RichText::new("Atajos").strong());
             for (k, v) in [
                 ("Arrastrar", "mover"),
-                ("Esquina rosa", "redimensionar"),
-                ("Lados blancos", "recortar la foto"),
+                ("Esquina rosa", "redimensionar (⇧ proporción)"),
+                ("Lados blancos", "recortar foto/video o estirar forma"),
                 ("⌘ + arrastrar", "mover foto en el recorte"),
                 ("⌥ + arrastrar", "sin imán"),
                 ("Flechas", "mover 1 px (⇧ 10 px)"),
@@ -908,8 +1097,9 @@ impl App {
         };
 
         let slide = self.doc.slide_of(&self.doc.layers[idx]);
-        let is_image = self.doc.layers[idx].is_image();
-        ui.heading(if is_image { "Foto" } else { "Texto" });
+        let is_media = self.doc.layers[idx].is_media();
+        let what = if self.doc.layers[idx].is_image() { "foto" } else { "video" };
+        ui.heading(self.doc.layers[idx].kind.label());
         ui.weak(format!("En el slide {}", slide + 1));
         ui.add_space(8.0);
 
@@ -917,7 +1107,44 @@ impl App {
         let before = self.doc.clone();
         let mut changed = false;
 
-        if is_image {
+        /// Selector de color con transparencia; devuelve si cambió.
+        fn color_row(ui: &mut egui::Ui, label: &str, color: &mut [u8; 4]) -> bool {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                let mut c = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                let changed = ui.color_edit_button_srgba(&mut c).changed();
+                if changed {
+                    *color = c.to_srgba_unmultiplied();
+                }
+                changed
+            })
+            .inner
+        }
+
+        if is_media {
+            if let Kind::Video { path, start, muted } = &mut self.doc.layers[idx].kind {
+                let info = self.videos.get(path).map(|v| v.info);
+                ui.label(egui::RichText::new("Video").strong());
+                if let Some(info) = info {
+                    ui.weak(format!("{}×{} · {:.1} s{}", info.width, info.height, info.duration, if info.has_audio { " · con sonido" } else { "" }));
+                    ui.horizontal(|ui| {
+                        ui.label("Empieza en");
+                        let max = (info.duration - 0.1).max(0.0);
+                        changed |= ui.add(egui::DragValue::new(start).range(0.0..=max).speed(0.05).suffix(" s").max_decimals(1)).changed();
+                    });
+                    let len = (info.duration - *start).clamp(0.0, video::MAX_SLIDE_SECONDS);
+                    ui.weak(format!("Se exporta como MP4 de {len:.1} s (Instagram admite hasta 60 s por slide)."));
+                    if info.has_audio {
+                        changed |= ui.checkbox(muted, "Sin sonido al exportar").changed();
+                    }
+                } else {
+                    ui.weak("Cargando información del video…");
+                }
+                if video::ffmpeg().is_none() {
+                    ui.colored_label(Color32::from_rgb(255, 190, 80), video::MISSING);
+                }
+                ui.add_space(8.0);
+            }
             ui.label(egui::RichText::new("Encajar").strong());
             ui.horizontal(|ui| {
                 ui.label("Ocupar");
@@ -929,7 +1156,7 @@ impl App {
                 if ui.button("Rellenar").on_hover_text("Cubre el área recortando lo que sobre").clicked() {
                     self.fit_selected(rect, true);
                 }
-                if ui.button("Encajar").on_hover_text("La foto completa, sin recortar").clicked() {
+                if ui.button("Encajar").on_hover_text(format!("La {what} completa, sin recortar")).clicked() {
                     self.fit_selected(rect, false);
                 }
             });
@@ -939,7 +1166,7 @@ impl App {
             }
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Recortar").strong());
-            ui.weak("Arrastra los tiradores blancos de los lados para recortar la foto; puedes volver a alargarla hasta su borde original. ⌘ + arrastrar mueve la foto dentro del recorte.");
+            ui.weak(format!("Arrastra los tiradores blancos de los lados para recortar la {what}; puedes volver a alargarla hasta su borde original. ⌘ + arrastrar la mueve dentro del recorte."));
             let crop = self.doc.layers[idx].crop;
             if !crop.is_full() {
                 let pct = |a: f32| format!("{:.0} %", a * 100.0);
@@ -949,7 +1176,7 @@ impl App {
                     pct(crop.v1 - crop.v0)
                 ));
             }
-            if ui.add_enabled(!crop.is_full(), egui::Button::new("Quitar recorte")).on_hover_text("Vuelve a mostrar la foto entera").clicked() {
+            if ui.add_enabled(!crop.is_full(), egui::Button::new("Quitar recorte")).on_hover_text(format!("Vuelve a mostrar la {what} entera")).clicked() {
                 self.reset_crop_selected();
             }
             ui.add_space(8.0);
@@ -960,8 +1187,16 @@ impl App {
                 ui.label("Esquinas");
                 changed |= ui.add(egui::Slider::new(&mut l.radius, 0.0..=max_r).suffix(" px").max_decimals(0)).changed();
             });
-        } else {
-            if let Kind::Text { text, size, color, align } = &mut self.doc.layers[idx].kind {
+            ui.horizontal(|ui| {
+                ui.label("Marco");
+                let max_b = (l.w.min(l.h) / 4.0).max(1.0);
+                changed |= ui.add(egui::Slider::new(&mut l.border, 0.0..=max_b).suffix(" px").max_decimals(0)).changed();
+            });
+            if l.border > 0.0 {
+                changed |= color_row(ui, "Color del marco", &mut l.border_color);
+            }
+        } else if matches!(self.doc.layers[idx].kind, Kind::Text { .. }) {
+            if let Kind::Text { text, size, color, align, background, shadow } = &mut self.doc.layers[idx].kind {
                 ui.label(egui::RichText::new("Contenido").strong());
                 changed |= ui
                     .add(egui::TextEdit::multiline(text).desired_rows(3).desired_width(f32::INFINITY))
@@ -970,20 +1205,22 @@ impl App {
                     ui.label("Tamaño");
                     changed |= ui.add(egui::DragValue::new(size).range(8.0..=800.0).speed(1.0)).changed();
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Color");
-                    let mut c = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-                    if ui.color_edit_button_srgba(&mut c).changed() {
-                        *color = c.to_srgba_unmultiplied();
-                        changed = true;
-                    }
-                });
+                changed |= color_row(ui, "Color", color);
                 ui.horizontal(|ui| {
                     ui.label("Alinear");
                     for (a, label) in [(TextAlign::Left, "Izq."), (TextAlign::Center, "Centro"), (TextAlign::Right, "Der.")] {
                         changed |= ui.selectable_value(align, a, label).changed();
                     }
                 });
+                let mut has_bg = background.is_some();
+                if ui.checkbox(&mut has_bg, "Recuadro de fondo").changed() {
+                    *background = has_bg.then_some([255, 255, 255, 235]);
+                    changed = true;
+                }
+                if let Some(bg) = background {
+                    changed |= color_row(ui, "Color del recuadro", bg);
+                }
+                changed |= ui.checkbox(shadow, "Sombra").changed();
             }
             let (sw, sh) = self.doc.slide_size();
             let (w, h) = (self.doc.layers[idx].w, self.doc.layers[idx].h);
@@ -992,6 +1229,67 @@ impl App {
                 let l = &mut self.doc.layers[idx];
                 l.x = slide as f32 * sw + (sw - w) / 2.0;
                 l.y = (sh - h) / 2.0;
+            }
+        } else {
+            let mut fit_slide = false;
+            match &mut self.doc.layers[idx].kind {
+                Kind::Emoji { emoji, sticker, style } => {
+                    let name = vector::emojis().iter().find(|e| e.emoji == emoji.as_str()).map(|e| e.name).unwrap_or("");
+                    ui.weak(name);
+                    ui.horizontal(|ui| {
+                        ui.label("Estilo");
+                        for s in doc::EmojiStyle::ALL {
+                            changed |= ui.selectable_value(style, s, s.label()).changed();
+                        }
+                    });
+                    changed |= ui.checkbox(sticker, "Efecto calcomanía (borde blanco y sombra)").changed();
+                }
+                Kind::Shape { shape, fill, stroke, stroke_w } => {
+                    egui::ComboBox::from_label("Forma").selected_text(shape.label()).show_ui(ui, |ui| {
+                        for k in ShapeKind::ALL {
+                            changed |= ui.selectable_value(shape, k, k.label()).changed();
+                        }
+                    });
+                    let line = *shape == ShapeKind::Line;
+                    changed |= color_row(ui, if line { "Color" } else { "Relleno" }, fill);
+                    if !line {
+                        let mut has_stroke = stroke[3] > 0;
+                        if ui.checkbox(&mut has_stroke, "Borde").changed() {
+                            stroke[3] = if has_stroke { 255 } else { 0 };
+                            changed = true;
+                        }
+                        if has_stroke {
+                            changed |= color_row(ui, "Color del borde", stroke);
+                            ui.horizontal(|ui| {
+                                ui.label("Grosor");
+                                changed |= ui.add(egui::Slider::new(stroke_w, 1.0..=120.0).suffix(" px").max_decimals(0)).changed();
+                            });
+                        }
+                        ui.weak("Estira la forma desde sus lados; ⇧ en la esquina mantiene la proporción.");
+                    } else {
+                        ui.weak("El grosor de la línea es el alto de su caja: estírala desde arriba o abajo.");
+                    }
+                }
+                Kind::Frame { frame, color, thickness } => {
+                    egui::ComboBox::from_label("Estilo").selected_text(frame.label()).show_ui(ui, |ui| {
+                        for k in FrameKind::ALL {
+                            changed |= ui.selectable_value(frame, k, k.label()).changed();
+                        }
+                    });
+                    changed |= color_row(ui, "Color", color);
+                    ui.horizontal(|ui| {
+                        ui.label("Grosor");
+                        changed |= ui.add(egui::Slider::new(thickness, 2.0..=200.0).suffix(" px").max_decimals(0)).changed();
+                    });
+                    fit_slide = ui.button("Ajustar al slide").clicked();
+                }
+                _ => {}
+            }
+            if fit_slide {
+                self.checkpoint();
+                let rect = self.doc.slides_rect(slide, 1);
+                let l = &mut self.doc.layers[idx];
+                (l.x, l.y, l.w, l.h) = rect;
             }
         }
 
@@ -1033,7 +1331,7 @@ impl App {
             }
         });
 
-        if let Some(Kind::Image { path }) = self.doc.layers.get(idx).map(|l| &l.kind) {
+        if let Some(Kind::Image { path } | Kind::Video { path, .. }) = self.doc.layers.get(idx).map(|l| &l.kind) {
             ui.add_space(12.0);
             ui.weak(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
             if let Some(err) = self.failed.get(path) {
@@ -1049,38 +1347,164 @@ impl App {
         let (cw, ch) = self.doc.canvas_size();
         let [r, g, b, _] = self.doc.background;
         painter.rect_filled(Rect::from_min_size(origin, Vec2::new(cw, ch) * zoom), 0.0, Color32::from_rgb(r, g, b));
+        let rgba = |c: [u8; 4], opacity: f32| {
+            Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (c[3] as f32 * opacity).round() as u8)
+        };
         for l in &self.doc.layers {
             let rect = Rect::from_min_max(to_screen(l.x, l.y), to_screen(l.x + l.w, l.y + l.h));
-            if !painter.clip_rect().intersects(rect) {
+            // Los textos con fondo o sombra sobresalen un poco de su caja.
+            if !painter.clip_rect().intersects(rect.expand(40.0)) {
                 continue;
             }
             let opacity = l.opacity.clamp(0.0, 1.0);
-            match &l.kind {
-                Kind::Image { path } => {
-                    if let Some(img) = self.images.get(path) {
-                        let radius = (l.radius.clamp(0.0, l.w.min(l.h) / 2.0) * zoom).min(255.0) as u8;
-                        let c = l.crop;
-                        let uv = Rect::from_min_max(Pos2::new(c.u0, c.v0), Pos2::new(c.u1, c.v1));
-                        let tint = Color32::WHITE.gamma_multiply(opacity);
-                        painter.add(RectShape::filled(rect, CornerRadius::same(radius), tint).with_texture(img.tex.id(), uv));
-                    } else {
-                        painter.rect_filled(rect, 0.0, Color32::from_gray(60));
-                        let msg = if self.failed.contains_key(path) { "⚠ no encontrada" } else { "cargando…" };
-                        painter.text(rect.center(), Align2::CENTER_CENTER, msg, FontId::proportional(13.0), Color32::LIGHT_GRAY);
+            let radius = (l.radius.clamp(0.0, l.w.min(l.h) / 2.0) * zoom).min(255.0) as u8;
+            let c = l.crop;
+            let uv = Rect::from_min_max(Pos2::new(c.u0, c.v0), Pos2::new(c.u1, c.v1));
+            let tint = Color32::WHITE.gamma_multiply(opacity);
+            let media_tex = match &l.kind {
+                Kind::Image { path } => Some(self.images.get(path).map(|i| i.tex.id()).ok_or(path)),
+                Kind::Video { path, .. } => Some(
+                    self.video_tex
+                        .get(&l.id)
+                        .map(|t| t.id())
+                        .or_else(|| self.videos.get(path).map(|v| v.poster.id()))
+                        .ok_or(path),
+                ),
+                _ => None,
+            };
+            match (&l.kind, media_tex) {
+                (_, Some(Ok(tex))) => {
+                    painter.add(RectShape::filled(rect, CornerRadius::same(radius), tint).with_texture(tex, uv));
+                    if l.border > 0.0 {
+                        let t = l.border.min(l.w.min(l.h) / 2.0) * zoom;
+                        let stroke = Stroke::new(t, rgba(l.border_color, opacity));
+                        painter.rect_stroke(rect, CornerRadius::same(radius), stroke, StrokeKind::Inside);
                     }
                 }
-                Kind::Text { text, size, color, align } => {
+                (_, Some(Err(path))) => {
+                    painter.rect_filled(rect, 0.0, Color32::from_gray(60));
+                    let msg = if self.failed.contains_key(path) { "⚠ no encontrado" } else { "cargando…" };
+                    painter.text(rect.center(), Align2::CENTER_CENTER, msg, FontId::proportional(13.0), Color32::LIGHT_GRAY);
+                }
+                (Kind::Text { text, size, color, align, background, shadow }, None) => {
+                    if let Some(bg) = background {
+                        let (px, py) = render::text_padding(*size);
+                        let bg_rect = Rect::from_min_max(to_screen(l.x - px, l.y - py), to_screen(l.x + l.w + px, l.y + l.h + py));
+                        let r = (size * 0.35 * zoom).min(255.0) as u8;
+                        painter.rect_filled(bg_rect, CornerRadius::same(r), rgba(*bg, opacity));
+                    }
                     let font = FontId::new(size * zoom, FontFamily::Name(CANVAS_FONT.into()));
-                    let alpha = (color[3] as f32 * opacity).round() as u8;
-                    let c = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], alpha);
                     let (x, anchor) = match align {
                         TextAlign::Left => (l.x, Align2::LEFT_TOP),
                         TextAlign::Center => (l.x + l.w / 2.0, Align2::CENTER_TOP),
                         TextAlign::Right => (l.x + l.w, Align2::RIGHT_TOP),
                     };
+                    let off = (size * 0.05).max(1.0);
                     for (i, line) in text.split('\n').enumerate() {
                         let p = to_screen(x, l.y + i as f32 * size * LINE_H);
-                        painter.text(p, anchor, line, font.clone(), c);
+                        if *shadow {
+                            let sp = p + Vec2::splat(off * zoom);
+                            painter.text(sp, anchor, line, font.clone(), rgba([0, 0, 0, 115], opacity));
+                        }
+                        painter.text(p, anchor, line, font.clone(), rgba(*color, opacity));
+                    }
+                }
+                (_, None) => {
+                    // Emojis, calcomanías, formas y marcos: textura generada por sync_vector_textures.
+                    if let Some(vt) = self.vector_tex.get(&l.id) {
+                        let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                        painter.image(vt.tex.id(), rect, full, tint);
+                    }
+                }
+            }
+            if l.is_video() && self.preview.is_none() {
+                // Distintivo para reconocer los videos en el editor.
+                let badge = Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(26.0, 18.0));
+                if painter.clip_rect().contains_rect(badge) {
+                    painter.rect_filled(badge, 4.0, Color32::from_black_alpha(160));
+                    painter.text(badge.center(), Align2::CENTER_CENTER, "▶", FontId::proportional(11.0), Color32::WHITE);
+                }
+            }
+        }
+    }
+
+    /// Genera (o reutiliza) la textura de cada capa vectorial a la resolución
+    /// con la que se va a ver; se regenera solo si cambia su contenido o el zoom
+    /// cambia lo bastante.
+    fn sync_vector_textures(&mut self, ctx: &egui::Context, zoom: f32) {
+        use std::hash::{Hash, Hasher};
+        let ppp = ctx.pixels_per_point();
+        let mut alive = Vec::new();
+        for l in &self.doc.layers {
+            let Some(svg) = vector::layer_svg(&l.kind, l.w, l.h) else { continue };
+            alive.push(l.id);
+            // Resolución en escalones de √2 para no regenerar con cada paso de zoom.
+            let target = (l.w.max(l.h) * zoom * ppp).clamp(16.0, 2048.0);
+            let step = 2f32.powf((target.log2() * 2.0).ceil() / 2.0);
+            let scale = (step / l.w.max(l.h)).min(2048.0 / l.w.max(l.h));
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            svg.hash(&mut hasher);
+            scale.to_bits().hash(&mut hasher);
+            let key = hasher.finish();
+            if self.vector_tex.get(&l.id).is_some_and(|v| v.key == key) {
+                continue;
+            }
+            let size = (((l.w * scale).ceil() as u32).max(1), ((l.h * scale).ceil() as u32).max(1));
+            if let Some(img) = vector::rasterize(&svg, scale, (0.0, 0.0), size) {
+                let color = egui::ColorImage::from_rgba_unmultiplied([size.0 as usize, size.1 as usize], img.as_raw());
+                match self.vector_tex.get_mut(&l.id) {
+                    Some(vt) => {
+                        vt.tex.set(color, egui::TextureOptions::LINEAR);
+                        vt.key = key;
+                    }
+                    None => {
+                        let tex = ctx.load_texture(format!("vector-{}", l.id), color, egui::TextureOptions::LINEAR);
+                        self.vector_tex.insert(l.id, VectorTex { key, tex });
+                    }
+                }
+            }
+        }
+        self.vector_tex.retain(|id, _| alive.contains(id));
+    }
+
+    /// Mantiene un reproductor por cada capa de video (si están activados) y
+    /// sube a la GPU el último fotograma de cada uno.
+    fn sync_video_players(&mut self, ctx: &egui::Context) {
+        let wanted: Vec<(u64, PathBuf, f32)> = if self.play_videos && video::ffmpeg().is_some() {
+            self.doc
+                .layers
+                .iter()
+                .filter_map(|l| match &l.kind {
+                    Kind::Video { path, start, .. } if self.videos.contains_key(path) => Some((l.id, path.clone(), *start)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.players.retain(|id, _| wanted.iter().any(|(w, _, _)| w == id));
+        self.video_tex.retain(|id, _| wanted.iter().any(|(w, _, _)| w == id));
+        // No relanzar el video mientras se arrastra el control de «inicio».
+        let settling = ctx.dragged_id().is_some();
+        for (id, path, start) in wanted {
+            let stale = self.players.get(&id).is_some_and(|p| p.path != path || (p.start - start).abs() > 0.01);
+            if (stale && !settling) || !self.players.contains_key(&id) {
+                let size = video::fit_size(&self.videos[&path].info, 640);
+                let repaint = ctx.clone();
+                match video::Player::new(&path, start, size, move || repaint.request_repaint()) {
+                    Ok(p) => {
+                        self.players.insert(id, p);
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
+            if let Some(frame) = self.players.get(&id).and_then(|p| p.take_frame()) {
+                let color = egui::ColorImage::from_rgba_unmultiplied([frame.width() as usize, frame.height() as usize], frame.as_raw());
+                match self.video_tex.get_mut(&id) {
+                    Some(t) => t.set(color, egui::TextureOptions::LINEAR),
+                    None => {
+                        let tex = ctx.load_texture(format!("video-{id}"), color, egui::TextureOptions::LINEAR);
+                        self.video_tex.insert(id, tex);
                     }
                 }
             }
@@ -1141,6 +1565,7 @@ impl App {
             }
         }
         let (pos, index) = (pv.pos, pv.index);
+        self.sync_vector_textures(&ctx, scale);
 
         painter.rect_filled(card.expand(1.0), 14.0, Color32::from_gray(10));
         let avatar = card.min + Vec2::new(26.0, header / 2.0);
@@ -1209,6 +1634,7 @@ impl App {
             self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX);
             self.fit_request = false;
         }
+        self.sync_vector_textures(&ctx, self.zoom);
 
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
             let zoom = self.zoom;
@@ -1284,28 +1710,37 @@ impl App {
             let handle = 12.0;
             let sel = self.selected.and_then(|id| self.doc.layers.iter().find(|l| l.id == id)).cloned();
             let sel_rect = sel.as_ref().map(|l| Rect::from_min_max(to_screen(l.x, l.y), to_screen(l.x + l.w, l.y + l.h)));
-            let sel_is_image = sel.as_ref().is_some_and(|l| l.is_image());
+            let sel_is_media = sel.as_ref().is_some_and(|l| l.is_media());
+            // Formas y marcos se estiran desde los lados; fotos y videos se recortan.
+            let sel_has_edges = sel.as_ref().is_some_and(|l| l.is_media() || l.is_stretchy());
 
             // Mientras se recorta o se mueve dentro del marco, la foto entera se
             // ve en transparente para saber hasta dónde se puede llegar.
             if let (Some(l), Some(drag), Some(r)) = (&sel, &self.drag, sel_rect) {
-                if let (DragMode::Crop(_) | DragMode::Pan, Kind::Image { path }) = (drag.mode, &l.kind) {
-                    if let Some(img) = self.images.get(path) {
+                let tex = match &l.kind {
+                    Kind::Image { path } => self.images.get(path).map(|i| i.tex.clone()),
+                    Kind::Video { path, .. } => {
+                        self.video_tex.get(&l.id).cloned().or_else(|| self.videos.get(path).map(|v| v.poster.clone()))
+                    }
+                    _ => None,
+                };
+                if let (DragMode::Crop(_) | DragMode::Pan, Some(tex)) = (drag.mode, tex) {
+                    {
                         let (fx, fy, fw, fh) = l.full_rect();
                         let full = Rect::from_min_max(to_screen(fx, fy), to_screen(fx + fw, fy + fh));
                         let all = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                        painter.image(img.tex.id(), full, all, Color32::WHITE.gamma_multiply(0.35));
+                        painter.image(tex.id(), full, all, Color32::WHITE.gamma_multiply(0.35));
                         painter.rect_stroke(full, 0.0, Stroke::new(1.0, Color32::from_white_alpha(140)), StrokeKind::Middle);
                         let c = l.crop;
                         let uv = Rect::from_min_max(Pos2::new(c.u0, c.v0), Pos2::new(c.u1, c.v1));
-                        painter.image(img.tex.id(), r, uv, Color32::WHITE);
+                        painter.image(tex.id(), r, uv, Color32::WHITE);
                     }
                 }
             }
 
             if let Some(r) = sel_rect {
                 painter.rect_stroke(r, 0.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
-                if sel_is_image {
+                if sel_has_edges {
                     for (_, h) in edge_handles(r) {
                         painter.rect_filled(h, 3.0, Color32::WHITE);
                         painter.rect_stroke(h, 3.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
@@ -1319,7 +1754,7 @@ impl App {
             // ----- interacción -----
             let on_corner = |p: Pos2| sel_rect.is_some_and(|r| Rect::from_center_size(r.max, Vec2::splat(handle + 6.0)).contains(p));
             let on_edge = |p: Pos2| -> Option<Edge> {
-                let r = sel_rect.filter(|_| sel_is_image)?;
+                let r = sel_rect.filter(|_| sel_has_edges)?;
                 edge_handles(r).into_iter().find(|(_, h)| h.expand(6.0).contains(p)).map(|(e, _)| e)
             };
             let hit = |doc: &Doc, p: Pos2| -> Option<u64> {
@@ -1337,7 +1772,7 @@ impl App {
                             Edge::Left | Edge::Right => egui::CursorIcon::ResizeHorizontal,
                             Edge::Top | Edge::Bottom => egui::CursorIcon::ResizeVertical,
                         });
-                    } else if command && sel_is_image && hit(&self.doc, p) == self.selected {
+                    } else if command && sel_is_media && hit(&self.doc, p) == self.selected {
                         ctx.set_cursor_icon(egui::CursorIcon::Grab);
                     }
                 }
@@ -1346,6 +1781,13 @@ impl App {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             }
 
+            // El slide en el que se hace clic recibe los elementos nuevos.
+            if resp.drag_started() || resp.clicked() || resp.secondary_clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let c = to_canvas(p);
+                    self.focus_slide = ((c.x / sw).floor().max(0.0) as u32).min(self.doc.slides - 1);
+                }
+            }
             if resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let corner = on_corner(p);
@@ -1356,8 +1798,9 @@ impl App {
                         let start = self.doc.layers.iter().find(|l| l.id == id).unwrap().clone();
                         let mode = match edge {
                             _ if corner => DragMode::Resize,
+                            Some(e) if start.is_stretchy() => DragMode::Stretch(e),
                             Some(e) => DragMode::Crop(e),
-                            None if command && start.is_image() => DragMode::Pan,
+                            None if command && start.is_media() => DragMode::Pan,
                             None => DragMode::Move,
                         };
                         self.checkpoint();
@@ -1393,6 +1836,11 @@ impl App {
                             }
                         }
                     }
+                    DragMode::Resize if s.is_stretchy() && !ctx.input(|i| i.modifiers.shift) => {
+                        // Formas y marcos: ancho y alto libres (⇧ mantiene la proporción).
+                        new.w = (s.w + d.x).max(doc::MIN_CROP);
+                        new.h = (s.h + d.y).max(doc::MIN_CROP);
+                    }
                     DragMode::Resize => {
                         let aspect = s.w / s.h.max(1.0);
                         let mut w = (s.w + d.x).max(s.w + d.y * aspect).max(20.0);
@@ -1412,7 +1860,7 @@ impl App {
                             }
                         }
                     }
-                    DragMode::Crop(edge) => {
+                    DragMode::Crop(edge) | DragMode::Stretch(edge) => {
                         let vertical_line = matches!(edge, Edge::Left | Edge::Right);
                         let (from, delta) = match edge {
                             Edge::Left => (s.x, d.x),
@@ -1433,7 +1881,11 @@ impl App {
                                 guide = Some(t);
                             }
                         }
-                        new.crop_edge(edge, to);
+                        if matches!(drag.mode, DragMode::Stretch(_)) {
+                            new.stretch_edge(edge, to);
+                        } else {
+                            new.crop_edge(edge, to);
+                        }
                         // Solo se muestra la guía si el borde llegó a ella (no se pasó del límite de la foto).
                         let landed = match edge {
                             Edge::Left => new.x,
@@ -1518,14 +1970,7 @@ impl App {
             // Fotos soltadas sobre la ventana.
             let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
             if !dropped.is_empty() {
-                let images: Vec<PathBuf> = dropped
-                    .into_iter()
-                    .filter(|p| {
-                        p.extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|e| IMAGE_EXT.contains(&e.to_lowercase().as_str()))
-                    })
-                    .collect();
+                let images: Vec<PathBuf> = dropped.into_iter().filter(|p| is_supported(p)).collect();
                 let pointer = ctx.input(|i| i.pointer.hover_pos());
                 match pointer.filter(|p| canvas_rect.contains(*p)) {
                     Some(p) if images.len() == 1 => {
@@ -1533,11 +1978,11 @@ impl App {
                         let slide = ((c.x / sw).floor().max(0.0) as u32).min(self.doc.slides - 1);
                         // Slide vacío → la foto lo rellena; si ya hay foto, se coloca donde la soltaste.
                         let occupied =
-                            self.doc.layers.iter().any(|l| l.is_image() && self.doc.slide_of(l) == slide);
+                            self.doc.layers.iter().any(|l| l.is_media() && self.doc.slide_of(l) == slide);
                         let place = if occupied { Place::At(c.x, c.y) } else { Place::Slide(slide) };
                         self.request_load(images[0].clone(), place, &ctx);
                     }
-                    _ => self.add_photos(images, &ctx),
+                    _ => self.add_media(images, &ctx),
                 }
             }
             let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -1596,6 +2041,7 @@ impl eframe::App for App {
         }
 
         self.receive_loads(&ctx);
+        self.sync_video_players(&ctx);
         self.poll_export(&ctx);
         self.sync_font(&ctx);
         self.shortcuts(&ctx);
@@ -1625,6 +2071,14 @@ impl eframe::App for App {
                 });
             });
         });
+        if self.library.open {
+            egui::Panel::left("library").resizable(true).default_size(250.0).show(ui, |ui| {
+                ui.add_space(8.0);
+                if let Some(action) = self.library.ui(ui) {
+                    self.apply_library(action);
+                }
+            });
+        }
         egui::Panel::right("inspector").resizable(true).default_size(270.0).show(ui, |ui| {
             ui.add_space(8.0);
             egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
