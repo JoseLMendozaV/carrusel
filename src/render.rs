@@ -3,7 +3,7 @@
 use crate::doc::{Doc, Kind, Layer, LINE_H};
 use crate::{vector, video};
 use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
-use image::{imageops, DynamicImage, ImageDecoder, ImageReader, Rgba, RgbaImage};
+use image::{imageops, DynamicImage, ImageDecoder, ImageEncoder, ImageReader, Rgba, RgbaImage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +22,35 @@ pub fn load_image(path: &Path) -> Result<RgbaImage, String> {
         img.apply_orientation(o);
     }
     Ok(img.to_rgba8())
+}
+
+/// Decodifica una imagen ya leída en memoria, respetando la orientación EXIF.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn decode_image(bytes: &[u8]) -> Result<RgbaImage, String> {
+    let reader = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().ok();
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    if let Some(o) = orientation {
+        img.apply_orientation(o);
+    }
+    Ok(img.to_rgba8())
+}
+
+/// Codifica una imagen en memoria (JPG calidad 95 o PNG), para la versión web.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn encode_image(img: RgbaImage, format: ExportFormat) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    match format {
+        ExportFormat::Png => image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8)
+            .map_err(|e| e.to_string())?,
+        ExportFormat::Jpg => {
+            let rgb = DynamicImage::ImageRgba8(img).to_rgb8();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95).encode_image(&rgb).map_err(|e| e.to_string())?
+        }
+    }
+    Ok(out)
 }
 
 /// Ancho de una sola línea de texto en píxeles del lienzo.

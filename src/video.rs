@@ -35,6 +35,9 @@ fn find_tool(name: &str) -> Option<PathBuf> {
 }
 
 pub fn ffmpeg() -> Option<&'static Path> {
+    if cfg!(target_arch = "wasm32") {
+        return None; // en el navegador no hay programas externos
+    }
     static P: OnceLock<Option<PathBuf>> = OnceLock::new();
     P.get_or_init(|| find_tool("ffmpeg")).as_deref()
 }
@@ -44,7 +47,10 @@ fn ffprobe() -> Option<&'static Path> {
     P.get_or_init(|| find_tool("ffprobe")).as_deref()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub const MISSING: &str = "Para usar videos instala ffmpeg (en la terminal: brew install ffmpeg) y vuelve a abrir Carrusel.";
+#[cfg(target_arch = "wasm32")]
+pub const MISSING: &str = "Los videos todavía no están disponibles en la versión web: para slides con video usa Carrusel en la Mac.";
 
 fn ffmpeg_cmd() -> Result<Command, String> {
     let mut c = Command::new(ffmpeg().ok_or(MISSING)?);

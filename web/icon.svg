@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#ff4081"/>
+  <!-- Una imagen panorámica que cruza tres slides -->
+  <rect x="56" y="150" width="400" height="212" rx="18" fill="#ffffff"/>
+  <rect x="70" y="164" width="372" height="184" rx="10" fill="#ffc46b"/>
+  <rect x="70" y="164" width="372" height="70" rx="10" fill="#ffe08f"/>
+  <circle cx="356" cy="214" r="22" fill="#ffffff"/>
+  <path d="M70 318 L166 246 L242 300 L318 234 L442 320 L442 338 Q442 348 432 348 L80 348 Q70 348 70 338 Z" fill="#2b2d42"/>
+  <rect x="186" y="150" width="6" height="212" fill="#ffffff"/>
+  <rect x="320" y="150" width="6" height="212" fill="#ffffff"/>
+  <circle cx="226" cy="410" r="10" fill="#ffffff"/>
+  <circle cx="256" cy="410" r="10" fill="#ffd0e0"/>
+  <circle cx="286" cy="410" r="10" fill="#ffd0e0"/>
+</svg>

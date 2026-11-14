@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <!-- Carrusel tiene su propio zoom: el de Safari solo estorbaría. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Carrusel</title>
+  <meta name="description" content="Creador de carruseles panorámicos para Instagram" />
+  <meta name="theme-color" content="#1c1c1c" />
+  <!-- «Añadir a pantalla de inicio» la abre a pantalla completa, como una app. -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="apple-mobile-web-app-title" content="Carrusel" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icon-180.png" />
+  <link rel="icon" type="image/png" href="icon-192.png" />
+
+  <link data-trunk rel="rust" data-cargo-profile="web-release" data-wasm-opt="2" data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue --strip-debug --strip-producers" />
+  <link data-trunk rel="copy-file" href="web/manifest.json" />
+  <link data-trunk rel="copy-file" href="web/sw.js" />
+  <link data-trunk rel="copy-file" href="web/icon-180.png" />
+  <link data-trunk rel="copy-file" href="web/icon-192.png" />
+  <link data-trunk rel="copy-file" href="web/icon-512.png" />
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1c1c1c;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-text-size-adjust: 100%;
+    }
+    #carrusel {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      outline: none;
+      touch-action: none;
+    }
+    #cargando {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      color: #bbb;
+      font: 15px -apple-system, system-ui, sans-serif;
+      text-align: center;
+      padding: 0 24px;
+    }
+    #cargando img { width: 84px; height: 84px; border-radius: 19px; }
+    #cargando .barra { width: 160px; height: 4px; border-radius: 2px; background: #333; overflow: hidden; }
+    #cargando .barra::after {
+      content: "";
+      display: block;
+      width: 40%;
+      height: 100%;
+      background: #ff4081;
+      animation: ir 1.1s ease-in-out infinite alternate;
+    }
+    @keyframes ir { from { transform: translateX(-10%); } to { transform: translateX(160%); } }
+  </style>
+</head>
+<body>
+  <canvas id="carrusel"></canvas>
+  <div id="cargando">
+    <img src="icon-180.png" alt="" />
+    <div class="barra"></div>
+    <p>Cargando Carrusel…</p>
+  </div>
+  <script>
+    // Evita el zoom de página de Safari al pellizcar (Carrusel hace el suyo).
+    document.addEventListener("gesturestart", (e) => e.preventDefault());
+    document.addEventListener("gesturechange", (e) => e.preventDefault());
+    // Funciona sin conexión una vez cargada (solo en https).
+    if ("serviceWorker" in navigator && location.protocol === "https:") {
+      navigator.serviceWorker.register("sw.js");
+    }
+  </script>
+</body>
+</html>

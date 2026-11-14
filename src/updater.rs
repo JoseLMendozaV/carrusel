@@ -2,7 +2,7 @@
 //! GitHub, descarga el .zip, verifica su huella SHA-256 y su firma, y cambia
 //! la app por la nueva al reiniciar.
 
-use crate::online;
+use crate::sys;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -64,17 +64,25 @@ fn parse_release(json: &serde_json::Value) -> Option<Release> {
 }
 
 /// El último release publicado (sin borradores ni versiones de prueba).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn latest() -> Result<Release, String> {
-    let data = online::get(&format!("https://api.github.com/repos/{REPO}/releases/latest"))?;
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let data = pollster::block_on(crate::online::get(&url))?;
     let json: serde_json::Value = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
     parse_release(&json).ok_or_else(|| "El último release no trae la app para Mac.".to_string())
+}
+
+/// La versión web se actualiza sola al recargar la página.
+#[cfg(target_arch = "wasm32")]
+pub fn latest() -> Result<Release, String> {
+    Err("La versión web siempre es la última.".into())
 }
 
 // ---------------------------------------------------------------------------
 // Comprobación automática: como mucho una vez al día
 
 fn stamp_path() -> PathBuf {
-    online::data_dir().join("ultima_comprobacion_actualizaciones")
+    sys::data_dir().join("ultima_comprobacion_actualizaciones")
 }
 
 pub fn due_for_check() -> bool {
@@ -133,7 +141,7 @@ fn bundle_version(app: &Path) -> Option<String> {
 /// Descarga y prepara la versión nueva. Devuelve la ruta de la app nueva,
 /// ya verificada. `progress` recibe la fracción descargada (0 a 1).
 pub fn download(release: &Release, progress: &dyn Fn(f32)) -> Result<PathBuf, String> {
-    let dir = online::cache_dir().join("actualizacion").join(&release.version);
+    let dir = sys::cache_dir().join("actualizacion").join(&release.version);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let zip = dir.join("Carrusel.zip");

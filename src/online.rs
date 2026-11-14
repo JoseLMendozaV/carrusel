@@ -1,85 +1,24 @@
 //! Bibliotecas en línea: iconos de Iconify y, con tu cuenta, ilustraciones de
-//! FreeSVG. Usa `curl` (incluido en macOS) y guarda en caché lo descargado.
+//! FreeSVG. En escritorio usa `curl` y guarda en disco lo descargado; en la
+//! web usa `fetch` (ver `sys`).
 
+use crate::sys::{self, Request};
 use crate::vector::fold;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-const AGENT: &str = "Carrusel/0.1 (+https://github.com/JoseLMendozaV/carrusel)";
-
-fn curl() -> Command {
-    let mut c = Command::new("curl");
-    c.args(["-sS", "-L", "--fail-with-body", "--max-time", "25", "-A", AGENT]);
-    c
+pub async fn get(url: &str) -> Result<Vec<u8>, String> {
+    sys::http(Request::get(url)).await
 }
 
-fn run(mut cmd: Command, stdin: Option<&str>) -> Result<Vec<u8>, String> {
-    cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|_| "No se encontró curl para conectarse a internet.".to_string())?;
-    if let (Some(data), Some(mut input)) = (stdin, child.stdin.take()) {
-        input.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+/// Descarga con caché (los iconos no cambian).
+async fn cached_get(key: &str, url: &str, max_age_days: Option<u64>) -> Result<Vec<u8>, String> {
+    if let Some(data) = sys::cache_get(key, max_age_days) {
+        return Ok(data);
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        let body = String::from_utf8_lossy(&out.stdout);
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!("Sin conexión o error del servidor. {}", if body.trim().is_empty() { err.trim() } else { body.trim() })
-            .chars()
-            .take(240)
-            .collect())
-    }
-}
-
-pub fn get(url: &str) -> Result<Vec<u8>, String> {
-    let mut c = curl();
-    c.arg(url);
-    run(c, None)
-}
-
-/// Carpeta de caché (en macOS, ~/Library/Caches/Carrusel).
-pub fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| if cfg!(target_os = "macos") { h.join("Library/Caches") } else { h.join(".cache") })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("Carrusel")
-}
-
-/// Carpeta de datos de la app (en macOS, ~/Library/Application Support/Carrusel).
-pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| if cfg!(target_os = "macos") { h.join("Library/Application Support") } else { h.join(".local/share") })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("Carrusel")
-}
-
-/// Descarga con caché en disco (los iconos no cambian).
-fn cached_get(key: &str, url: &str, max_age_days: Option<u64>) -> Result<Vec<u8>, String> {
-    let path = cache_dir().join(key);
-    if let Ok(meta) = std::fs::metadata(&path) {
-        let fresh = max_age_days.is_none_or(|days| {
-            meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age.as_secs() < days * 86_400)
-        });
-        if fresh {
-            if let Ok(data) = std::fs::read(&path) {
-                return Ok(data);
-            }
-        }
-    }
-    let data = get(url)?;
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&path, &data);
+    let data = get(url).await?;
+    sys::cache_put(key, &data);
     Ok(data)
 }
 
@@ -179,7 +118,7 @@ pub fn icon_set(prefix: &str) -> Option<&'static IconSet> {
 }
 
 /// Colecciones de Iconify con licencia apta (se refresca cada semana).
-pub fn icon_sets() -> Result<&'static HashMap<String, IconSet>, String> {
+pub async fn icon_sets() -> Result<&'static HashMap<String, IconSet>, String> {
     if let Some(s) = SETS.get() {
         return Ok(s);
     }
@@ -197,7 +136,7 @@ pub fn icon_sets() -> Result<&'static HashMap<String, IconSet>, String> {
         #[serde(default)]
         hidden: bool,
     }
-    let data = cached_get("iconify/collections.json", "https://api.iconify.design/collections", Some(7))?;
+    let data = cached_get("iconify/collections.json", "https://api.iconify.design/collections", Some(7)).await?;
     let raw: HashMap<String, Info> = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
     let sets = raw
         .into_iter()
@@ -211,18 +150,18 @@ pub fn icon_sets() -> Result<&'static HashMap<String, IconSet>, String> {
 }
 
 /// Busca iconos; devuelve nombres «prefijo:icono» y si hay más resultados.
-pub fn search_icons(query: &str, start: usize) -> Result<(Vec<String>, bool), String> {
+pub async fn search_icons(query: &str, start: usize) -> Result<(Vec<String>, bool), String> {
     const LIMIT: usize = 96;
     #[derive(Deserialize)]
     struct Res {
         icons: Vec<String>,
         total: usize,
     }
-    let sets = icon_sets()?;
+    let sets = icon_sets().await?;
     let q = to_english(query);
     // La API pagina así: `limit` es el total acumulado y `start` el primero a devolver.
     let url = format!("https://api.iconify.design/search?query={}&limit={}&start={start}", encode(&q), start + LIMIT);
-    let res: Res = serde_json::from_slice(&get(&url)?).map_err(|e| e.to_string())?;
+    let res: Res = serde_json::from_slice(&get(&url).await?).map_err(|e| e.to_string())?;
     let more = res.total > start + res.icons.len();
     let icons: Vec<String> =
         res.icons.into_iter().filter(|n| n.split_once(':').is_some_and(|(p, _)| sets.contains_key(p))).collect();
@@ -230,7 +169,7 @@ pub fn search_icons(query: &str, start: usize) -> Result<(Vec<String>, bool), St
 }
 
 /// SVG de varios iconos de golpe (agrupados por colección), con caché.
-pub fn icon_svgs(names: &[String]) -> HashMap<String, String> {
+pub async fn icon_svgs(names: &[String]) -> HashMap<String, String> {
     #[derive(Deserialize)]
     struct Icon {
         body: String,
@@ -249,8 +188,8 @@ pub fn icon_svgs(names: &[String]) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let mut by_prefix: HashMap<&str, Vec<&str>> = HashMap::new();
     for n in names {
-        let path = cache_dir().join("iconify/icons").join(format!("{}.svg", n.replace(':', "_")));
-        if let Ok(svg) = std::fs::read_to_string(&path) {
+        let key = format!("iconify/icons/{}.svg", n.replace(':', "_"));
+        if let Some(svg) = sys::cache_get(&key, None).and_then(|b| String::from_utf8(b).ok()) {
             out.insert(n.clone(), svg);
         } else if let Some((p, i)) = n.split_once(':') {
             by_prefix.entry(p).or_default().push(i);
@@ -258,7 +197,7 @@ pub fn icon_svgs(names: &[String]) -> HashMap<String, String> {
     }
     for (prefix, icons) in by_prefix {
         let url = format!("https://api.iconify.design/{prefix}.json?icons={}", icons.join(","));
-        let Ok(data) = get(&url) else { continue };
+        let Ok(data) = get(&url).await else { continue };
         let Ok(set) = serde_json::from_slice::<Set>(&data) else { continue };
         for (name, icon) in set.icons {
             let w = icon.width.or(set.width).unwrap_or(16.0);
@@ -270,11 +209,7 @@ pub fn icon_svgs(names: &[String]) -> HashMap<String, String> {
                 icon.body
             );
             let full = format!("{prefix}:{name}");
-            let path = cache_dir().join("iconify/icons").join(format!("{prefix}_{name}.svg"));
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(path, &svg);
+            sys::cache_put(&format!("iconify/icons/{prefix}_{name}.svg"), svg.as_bytes());
             out.insert(full, svg);
         }
     }
@@ -287,40 +222,30 @@ pub fn icon_svgs(names: &[String]) -> HashMap<String, String> {
 
 const FREESVG_API: &str = "https://freesvg.org/api/v1";
 
-fn token_path() -> PathBuf {
-    data_dir().join("freesvg_token")
-}
+const TOKEN_KEY: &str = "freesvg_token";
 
 pub fn freesvg_token() -> Option<String> {
-    std::fs::read_to_string(token_path()).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+    sys::setting_get(TOKEN_KEY)
 }
 
 pub fn freesvg_logout() {
-    let _ = std::fs::remove_file(token_path());
+    sys::setting_remove(TOKEN_KEY);
 }
 
-pub fn freesvg_login(email: &str, password: &str) -> Result<String, String> {
+pub async fn freesvg_login(email: &str, password: &str) -> Result<String, String> {
     let body = serde_json::json!({ "email": email, "password": password }).to_string();
-    let mut c = curl();
-    c.args(["-X", "POST", "-H", "Accept: application/json", "-H", "Content-Type: application/json", "--data-binary", "@-"])
-        .arg(format!("{FREESVG_API}/auth/login"));
-    let data = run(c, Some(&body)).map_err(|_| "No se pudo iniciar sesión: revisa el correo y la contraseña.".to_string())?;
+    let url = format!("{FREESVG_API}/auth/login");
+    let mut req = Request::get(&url).header("Accept", "application/json").header("Content-Type", "application/json");
+    req.method = "POST";
+    req.body = Some(body);
+    let data = sys::http(req).await.map_err(|_| "No se pudo iniciar sesión: revisa el correo y la contraseña.".to_string())?;
     let json: serde_json::Value = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
     let token = json["token"]
         .as_str()
         .or(json["access_token"].as_str())
         .ok_or_else(|| json["message"].as_str().unwrap_or("FreeSVG no devolvió un token.").to_string())?
         .to_string();
-    let path = token_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    std::fs::write(&path, &token).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    sys::setting_set(TOKEN_KEY, &token)?;
     Ok(token)
 }
 
@@ -332,10 +257,9 @@ pub struct FreeSvgItem {
     pub svg: String,
 }
 
-fn freesvg_request(token: &str, url: &str, accept: &str) -> Result<Vec<u8>, String> {
-    let mut c = curl();
-    c.args(["-H", &format!("Accept: {accept}"), "-H"]).arg(format!("Authorization: Bearer {token}")).arg(url);
-    run(c, None).map_err(|e| {
+async fn freesvg_request(token: &str, url: &str, accept: &str) -> Result<Vec<u8>, String> {
+    let req = Request::get(url).header("Accept", accept).header("Authorization", format!("Bearer {token}"));
+    sys::http(req).await.map_err(|e| {
         if e.contains("401") || e.to_lowercase().contains("unauthenticated") {
             "La sesión de FreeSVG caducó: vuelve a entrar.".to_string()
         } else {
@@ -370,17 +294,17 @@ fn parse_freesvg(json: &serde_json::Value, page: u32) -> (Vec<FreeSvgItem>, bool
 }
 
 /// Busca ilustraciones (25 por página); devuelve resultados y si hay más páginas.
-pub fn freesvg_search(token: &str, query: &str, page: u32) -> Result<(Vec<FreeSvgItem>, bool), String> {
+pub async fn freesvg_search(token: &str, query: &str, page: u32) -> Result<(Vec<FreeSvgItem>, bool), String> {
     let url = format!("{FREESVG_API}/search?query={}&page={page}", encode(&to_english(query)));
-    let data = freesvg_request(token, &url, "application/json")?;
+    let data = freesvg_request(token, &url, "application/json").await?;
     let json: serde_json::Value = serde_json::from_slice(&data).map_err(|_| "FreeSVG respondió algo inesperado.".to_string())?;
     Ok(parse_freesvg(&json, page))
 }
 
 /// Descarga el SVG de una ilustración (FreeSVG exige la sesión también aquí;
 /// sin ella devuelve una página web con captcha en lugar del archivo).
-pub fn freesvg_download(token: &str, url: &str) -> Result<String, String> {
-    let data = freesvg_request(token, url, "image/svg+xml, */*")?;
+pub async fn freesvg_download(token: &str, url: &str) -> Result<String, String> {
+    let data = freesvg_request(token, url, "image/svg+xml, */*").await?;
     let text = String::from_utf8_lossy(&data).into_owned();
     if !text.contains("<svg") {
         return Err("FreeSVG no entregó el archivo: vuelve a entrar con tu cuenta.".into());
@@ -435,9 +359,9 @@ mod tests {
     #[test]
     #[ignore]
     fn iconify_en_vivo() {
-        let (icons, _) = search_icons("corazón", 0).unwrap();
+        let (icons, _) = pollster::block_on(search_icons("corazón", 0)).unwrap();
         assert!(!icons.is_empty());
-        let svgs = icon_svgs(&icons[..5.min(icons.len())]);
+        let svgs = pollster::block_on(icon_svgs(&icons[..5.min(icons.len())]));
         assert!(!svgs.is_empty());
         for svg in svgs.values() {
             assert!(crate::vector::sanitize_svg(svg).is_some(), "{svg}");
@@ -450,13 +374,13 @@ mod tests {
     #[ignore]
     fn freesvg_en_vivo() {
         let token = freesvg_token().expect("entra primero en FreeSVG desde la app");
-        let (items, more) = freesvg_search(&token, "flores", 1).unwrap();
+        let (items, more) = pollster::block_on(freesvg_search(&token, "flores", 1)).unwrap();
         println!("{} resultados en la página 1 (más páginas: {more})", items.len());
         assert!(!items.is_empty());
         let mut drawn = 0;
         for item in items.iter().take(4) {
-            let thumb = get(&item.thumb).ok().and_then(|b| image::load_from_memory(&b).ok());
-            let svg = freesvg_download(&token, &item.svg).unwrap();
+            let thumb = pollster::block_on(get(&item.thumb)).ok().and_then(|b| image::load_from_memory(&b).ok());
+            let svg = pollster::block_on(freesvg_download(&token, &item.svg)).unwrap();
             let clean = crate::vector::sanitize_svg(&svg);
             println!("#{} «{}»: miniatura {}, SVG {} KB, dibujable {}", item.id, item.title, thumb.is_some(), svg.len() / 1024, clean.is_some());
             if let Some(clean) = clean {

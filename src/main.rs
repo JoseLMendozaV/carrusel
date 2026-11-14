@@ -1,4 +1,9 @@
 //! Carrusel — creador de carruseles panorámicos para Instagram (estilo SCRL).
+//! Corre como app de escritorio y, compilado a WebAssembly, en el navegador
+//! (pensado para iPad): ver `sys` y `web_app`.
+
+// En la web no se usan las partes de escritorio (videos, exportar a carpeta…).
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 mod doc;
 mod layers;
@@ -6,9 +11,12 @@ mod library;
 mod online;
 mod render;
 mod scrapbook;
+mod sys;
 mod updater;
 mod vector;
 mod video;
+#[cfg(target_arch = "wasm32")]
+mod web_app;
 
 use ab_glyph::FontArc;
 use doc::{fit, Crop, Doc, Edge, Format, FrameKind, Kind, Layer, ShapeKind, TextAlign, INSTAGRAM_MAX, LINE_H};
@@ -23,6 +31,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
 const IMAGE_EXT: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
+/// En la web el navegador decodifica también estos (Safari entiende HEIC).
+const WEB_IMAGE_EXT: &[&str] = &["heic", "heif", "avif"];
 /// Texto que añade el botón «＋ Texto».
 const DEFAULT_TEXT: library::TextPreset = library::TextPreset {
     label: "Texto",
@@ -35,8 +45,8 @@ const DEFAULT_TEXT: library::TextPreset = library::TextPreset {
 };
 
 fn is_supported(path: &Path) -> bool {
-    video::is_video(path)
-        || path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXT.contains(&e.to_lowercase().as_str()))
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    video::is_video(path) || IMAGE_EXT.contains(&ext.as_str()) || (sys::WEB && WEB_IMAGE_EXT.contains(&ext.as_str()))
 }
 const ACCENT: Color32 = Color32::from_rgb(255, 64, 129);
 const CANVAS_FONT: &str = "canvas";
@@ -76,6 +86,7 @@ enum ExportTarget {
     ScrollVideo,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -86,6 +97,26 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("Carrusel", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    web_app::start();
+}
+
+/// Controles algo más grandes y separados para usarlos con el dedo.
+fn touch_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|s| {
+        s.spacing.interact_size.y = 30.0;
+        s.spacing.button_padding = Vec2::new(10.0, 6.0);
+        s.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        s.spacing.slider_width = 130.0;
+        s.spacing.icon_width = 18.0;
+        s.spacing.combo_height = 320.0;
+        for font in s.text_styles.values_mut() {
+            font.size += 1.0;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +239,16 @@ struct App {
     show_update_notes: bool,
     exporting: Option<mpsc::Receiver<ExportMsg>>,
     status: String,
+    /// Arrastrar una foto la mueve dentro de su recorte (lo que en la Mac
+    /// se hace con ⌘ + arrastrar), para usarlo con el dedo.
+    pan_crop_mode: bool,
+    /// Se está desplazando el lienzo arrastrando el fondo.
+    panning: bool,
+    /// Origen del lienzo en pantalla en el fotograma anterior (para hacer
+    /// zoom alrededor del puntero o de los dedos).
+    last_origin: Option<Pos2>,
+    #[cfg(target_arch = "wasm32")]
+    web: web_app::WebState,
 }
 
 impl App {
@@ -216,6 +257,9 @@ impl App {
         visuals.selection.bg_fill = ACCENT;
         visuals.hyperlink_color = ACCENT;
         cc.egui_ctx.set_visuals(visuals);
+        if sys::WEB {
+            touch_style(&cc.egui_ctx);
+        }
 
         let (load_tx, load_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
@@ -260,13 +304,25 @@ impl App {
             update_rx,
             show_update_notes: false,
             exporting: None,
-            status: "Arrastra fotos o videos a la ventana, o usa «＋ Fotos / videos».".into(),
+            status: if sys::WEB {
+                "Toca «＋ Fotos» para empezar.".into()
+            } else {
+                "Arrastra fotos o videos a la ventana, o usa «＋ Fotos / videos».".into()
+            },
+            pan_crop_mode: false,
+            panning: false,
+            last_origin: None,
+            #[cfg(target_arch = "wasm32")]
+            web: web_app::WebState::default(),
         };
         app.sync_font(&cc.egui_ctx);
-        // Una vez al día, en segundo plano, mira si hay una versión nueva.
-        if updater::due_for_check() {
+        // Una vez al día, en segundo plano, mira si hay una versión nueva
+        // (la versión web siempre es la última).
+        if !sys::WEB && updater::due_for_check() {
             app.check_updates(&cc.egui_ctx, false);
         }
+        #[cfg(target_arch = "wasm32")]
+        app.web_init(&cc.egui_ctx);
         app
     }
 
@@ -447,6 +503,19 @@ impl App {
         if !self.dirty || (self.path.is_none() && self.doc.layers.is_empty()) {
             return true;
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            sys::confirm(&format!(
+                "«{}» tiene cambios que no guardaste en un archivo.\n\n¿Descartarlos? (Cancela y toca «Guardar» si quieres conservar una copia.)",
+                self.doc_name()
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.confirm_discard_native()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn confirm_discard_native(&mut self) -> bool {
         let (save, discard) = ("Guardar", "No guardar");
         let answer = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Warning)
@@ -503,7 +572,7 @@ impl App {
         if self.font_loaded_for.as_ref() == Some(&self.doc.font) {
             return;
         }
-        let bytes: Option<Vec<u8>> = self.doc.font.as_ref().and_then(|p| std::fs::read(p).ok());
+        let bytes: Option<Vec<u8>> = self.doc.font.as_ref().and_then(|p| sys::read(p).ok());
         let parsed = bytes.as_ref().and_then(|b| FontArc::try_from_vec(b.clone()).ok());
         let mut defs = egui::FontDefinitions::default();
         let data = match (bytes, parsed) {
@@ -536,7 +605,7 @@ impl App {
         self.pending += 1;
         let tx = self.load_tx.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        sys::spawn(async move {
             let result = if video::is_video(&path) {
                 video::probe(&path).and_then(|info| {
                     let size = video::fit_size(&info, 640);
@@ -545,7 +614,7 @@ impl App {
                     Ok(LoadedData::Video(info, color))
                 })
             } else {
-                render::load_image(&path).map(|full| {
+                sys::load_image(&path).await.map(|full| {
                     // Textura de vista previa (máx. 2048 px); la original se usa al exportar.
                     let s = (2048.0 / full.width().max(full.height()) as f32).min(1.0);
                     let tw = ((full.width() as f32 * s) as u32).max(1);
@@ -841,6 +910,14 @@ impl App {
         if !self.confirm_discard() {
             return;
         }
+        #[cfg(target_arch = "wasm32")]
+        self.web_open(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.open_native(ctx);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_native(&mut self, ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new().add_filter("Proyecto Carrusel", &["carrusel"]).pick_file() else {
             return;
         };
@@ -849,34 +926,50 @@ impl App {
             .and_then(|s| serde_json::from_str::<Doc>(&s).map_err(|e| e.to_string()))
         {
             Ok(doc) => {
-                self.checkpoint();
-                self.doc = doc;
-                self.path = Some(path.clone());
-                self.selected = None;
-                self.fit_request = true;
-                self.dirty = false;
-                let paths: Vec<PathBuf> = self
-                    .doc
-                    .layers
-                    .iter()
-                    .filter_map(|l| match &l.kind {
-                        Kind::Image { path } | Kind::Video { path, .. } => Some(path.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                for p in paths {
-                    if !self.images.contains_key(&p) && !self.videos.contains_key(&p) {
-                        self.request_load(p, Place::Cache, ctx);
-                    }
-                }
-                self.sync_font(ctx);
+                self.set_doc(doc, Some(path.clone()), ctx);
                 self.status = format!("Abierto {}", path.display());
             }
             Err(e) => self.status = format!("No se pudo abrir el proyecto: {e}"),
         }
     }
 
+    /// Cambia al documento `doc` (recién abierto) y empieza a cargar sus fotos.
+    fn set_doc(&mut self, doc: Doc, path: Option<PathBuf>, ctx: &egui::Context) {
+        self.checkpoint();
+        self.doc = doc;
+        self.path = path;
+        self.selected = None;
+        self.fit_request = true;
+        self.dirty = false;
+        let paths: Vec<PathBuf> = self
+            .doc
+            .layers
+            .iter()
+            .filter_map(|l| match &l.kind {
+                Kind::Image { path } | Kind::Video { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        for p in paths {
+            if !self.images.contains_key(&p) && !self.videos.contains_key(&p) {
+                self.request_load(p, Place::Cache, ctx);
+            }
+        }
+        self.sync_font(ctx);
+    }
+
     fn save(&mut self, save_as: bool) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = save_as;
+            self.web_save();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.save_native(save_as);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_native(&mut self, save_as: bool) {
         let path = match (&self.path, save_as) {
             (Some(p), false) => p.clone(),
             _ => match rfd::FileDialog::new()
@@ -913,6 +1006,14 @@ impl App {
             self.status = video::MISSING.into();
             return;
         }
+        #[cfg(target_arch = "wasm32")]
+        self.web_export(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.export_native(ctx);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn export_native(&mut self, ctx: &egui::Context) {
         let target = match self.export_target {
             ExportTarget::Carousel => rfd::FileDialog::new().set_title("Carpeta de exportación").pick_folder(),
             ExportTarget::ScrollVideo => rfd::FileDialog::new()
@@ -1103,10 +1204,23 @@ impl App {
             if ui.button("Abrir…").on_hover_text("⌘O").clicked() {
                 self.open(&ctx);
             }
-            if ui.button("Guardar").on_hover_text("⌘S").clicked() {
+            let save_tip = if sys::WEB { "Descarga el proyecto (.carrusel) con sus fotos, para tener una copia" } else { "⌘S" };
+            if ui.button("Guardar").on_hover_text(save_tip).clicked() {
                 self.save(false);
             }
             ui.separator();
+            if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Deshacer")).on_hover_text("⌘Z").clicked() {
+                self.undo();
+            }
+            if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Rehacer")).on_hover_text("⇧⌘Z").clicked() {
+                self.redo();
+            }
+            ui.separator();
+            #[cfg(target_arch = "wasm32")]
+            if ui.button("＋ Fotos").clicked() {
+                self.web_pick_media(&ctx);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             if ui.button("＋ Fotos / videos").clicked() {
                 let all: Vec<&str> = IMAGE_EXT.iter().chain(video::VIDEO_EXT).copied().collect();
                 if let Some(paths) = rfd::FileDialog::new()
@@ -1145,6 +1259,25 @@ impl App {
                     "Instagram publica hasta {INSTAGRAM_MAX} slides por post. Puedes diseñar más y repartirlos en varias publicaciones."
                 ));
             }
+            // Insertar y quitar slides sin clic derecho (en iPad, sin mantener pulsado).
+            let current = self.current_slide();
+            ui.menu_button("Slide", |ui| {
+                ui.weak(format!("Slide {} de {}", current + 1, self.doc.slides));
+                if ui.button("Insertar slide antes").clicked() {
+                    self.insert_slide(current);
+                    ui.close();
+                }
+                if ui.button("Insertar slide después").clicked() {
+                    self.insert_slide(current + 1);
+                    ui.close();
+                }
+                if ui.add_enabled(self.doc.slides > 1, egui::Button::new("Eliminar este slide")).clicked() {
+                    self.remove_slide(current);
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Insertar o eliminar el slide actual (también con clic derecho en el lienzo)");
             ui.label("Fondo");
             let mut bg = Color32::from_rgba_unmultiplied(
                 self.doc.background[0],
@@ -1161,10 +1294,13 @@ impl App {
                 self.fit_request = true;
             }
             ui.separator();
-            ui.add_enabled(
-                self.preview.is_none(),
-                egui::Slider::new(&mut self.zoom, ZOOM_MIN..=ZOOM_MAX).text("Zoom").logarithmic(true),
-            );
+            // En la web el zoom se hace pellizcando (el deslizador no cabe en la barra).
+            if !sys::WEB {
+                ui.add_enabled(
+                    self.preview.is_none(),
+                    egui::Slider::new(&mut self.zoom, ZOOM_MIN..=ZOOM_MAX).text("Zoom").logarithmic(true),
+                );
+            }
             if ui.add_enabled(self.preview.is_none(), egui::Button::new("Ajustar")).clicked() {
                 self.fit_request = true;
             }
@@ -1179,6 +1315,22 @@ impl App {
                 self.toggle_preview();
             }
             ui.separator();
+            if sys::WEB {
+                // En la web todavía no hay videos: solo el carrusel de fotos.
+                self.export_target = ExportTarget::Carousel;
+            } else {
+                self.export_target_combo(ui);
+            }
+            self.export_options(ui);
+            let label = if self.exporting.is_some() { "Exportando…" } else { "Exportar" };
+            let btn = egui::Button::new(egui::RichText::new(label).strong().color(Color32::WHITE)).fill(ACCENT);
+            if ui.add_enabled(self.exporting.is_none(), btn).on_hover_text("⌘E").clicked() {
+                self.start_export(&ctx);
+            }
+        });
+    }
+
+    fn export_target_combo(&mut self, ui: &mut egui::Ui) {
             egui::ComboBox::from_id_salt("exp_target")
                 .selected_text(match self.export_target {
                     ExportTarget::Carousel => "Carrusel",
@@ -1190,6 +1342,9 @@ impl App {
                     ui.selectable_value(&mut self.export_target, ExportTarget::ScrollVideo, "Video 9:16 (Reels / TikTok)")
                         .on_hover_text("Un solo video vertical 1080×1920 que recorre el carrusel");
                 });
+    }
+
+    fn export_options(&mut self, ui: &mut egui::Ui) {
             match self.export_target {
                 ExportTarget::Carousel => {
                     egui::ComboBox::from_id_salt("exp_fmt")
@@ -1210,12 +1365,6 @@ impl App {
                     ui.weak("por slide");
                 }
             }
-            let label = if self.exporting.is_some() { "Exportando…" } else { "Exportar" };
-            let btn = egui::Button::new(egui::RichText::new(label).strong().color(Color32::WHITE)).fill(ACCENT);
-            if ui.add_enabled(self.exporting.is_none(), btn).on_hover_text("⌘E").clicked() {
-                self.start_export(&ctx);
-            }
-        });
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
@@ -1239,6 +1388,11 @@ impl App {
                 .unwrap_or_else(|| "Ubuntu Light (integrada)".into());
             ui.label(name);
             ui.horizontal(|ui| {
+                #[cfg(target_arch = "wasm32")]
+                if ui.button("Elegir fuente…").on_hover_text("Un archivo .ttf, .otf o .ttc de Archivos").clicked() {
+                    self.web_pick_font(&ctx);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
                 if ui.button("Elegir fuente…").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("Fuentes", &["ttf", "otf", "ttc"]).pick_file() {
                         self.checkpoint();
@@ -1253,6 +1407,28 @@ impl App {
                 }
             });
             ui.add_space(14.0);
+            if sys::WEB {
+                ui.label(egui::RichText::new("Con el dedo").strong());
+                for (k, v) in [
+                    ("Arrastrar", "mover"),
+                    ("Esquina rosa", "redimensionar"),
+                    ("Lados blancos", "recortar foto o estirar forma"),
+                    ("Pellizcar", "zoom"),
+                    ("Dos dedos / fondo", "desplazar el lienzo"),
+                    ("Mantener pulsado", "slides y capa"),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(k).monospace());
+                        ui.weak(v);
+                    });
+                }
+                ui.add_space(8.0);
+                ui.weak("Con teclado también funcionan los atajos de la Mac (⌘Z, ⌘D, ⌫, flechas…).");
+                ui.add_space(14.0);
+                ui.label(egui::RichText::new(format!("Carrusel {} · web", updater::current_version())).strong());
+                ui.weak("Tu proyecto se guarda solo en este navegador mientras trabajas. Toca «Guardar» para tener una copia en Archivos.");
+                return;
+            }
             ui.label(egui::RichText::new("Atajos").strong());
             for (k, v) in [
                 ("Arrastrar", "mover"),
@@ -1369,7 +1545,10 @@ impl App {
             }
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Recortar").strong());
-            ui.weak(format!("Arrastra los tiradores blancos de los lados para recortar la {what}; puedes volver a alargarla hasta su borde original. ⌘ + arrastrar la mueve dentro del recorte."));
+            let pan_tip = if sys::WEB { "" } else { " ⌘ + arrastrar la mueve dentro del recorte." };
+            ui.weak(format!("Arrastra los tiradores blancos de los lados para recortar la {what}; puedes volver a alargarla hasta su borde original.{pan_tip}"));
+            ui.toggle_value(&mut self.pan_crop_mode, format!("Mover la {what} dentro del recorte"))
+                .on_hover_text("Mientras esté activo, arrastrar la foto cambia la parte que se ve en lugar de moverla");
             let crop = self.doc.layers[idx].crop;
             if !crop.is_full() {
                 let pct = |a: f32| format!("{:.0} %", a * 100.0);
@@ -1849,7 +2028,7 @@ impl App {
         painter.text(
             Pos2::new(area.center().x, area.max.y - 14.0),
             Align2::CENTER_BOTTOM,
-            "Arrastra o usa ← → para pasar de slide · Esc o P para volver a editar",
+            if sys::WEB { "Desliza para pasar de slide · toca «Editar» para volver" } else { "Arrastra o usa ← → para pasar de slide · Esc o P para volver a editar" },
             FontId::proportional(12.0),
             Color32::from_gray(120),
         );
@@ -1870,6 +2049,35 @@ impl App {
         self.sync_vector_textures(&ctx, self.zoom);
 
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            let instant = egui::style::ScrollAnimation::none();
+            // Zoom con ⌘+rueda o pellizco, alrededor del puntero o de los dedos:
+            // ese punto del lienzo se queda donde estaba. Se aplica antes de
+            // reservar el espacio para que el desplazamiento quepa ya.
+            let touch = ctx.multi_touch().filter(|t| ui.clip_rect().contains(t.center_pos));
+            let over = touch.is_some() || ui.rect_contains_pointer(ui.clip_rect());
+            let dz = if over { ctx.input(|i| i.zoom_delta()) } else { 1.0 };
+            if dz != 1.0 {
+                let old = self.zoom;
+                self.zoom = (old * dz).clamp(ZOOM_MIN, ZOOM_MAX);
+                let pivot = touch.map(|t| t.center_pos).or_else(|| ctx.pointer_hover_pos());
+                if let (Some(p), Some(o)) = (pivot, self.last_origin) {
+                    let c = (p - o) / old;
+                    ui.scroll_with_delta_animation(-c * (self.zoom - old), instant);
+                }
+            }
+            // Dos dedos: desplazar el lienzo. Si el primer dedo ya movía una
+            // capa, ese movimiento se deshace.
+            if let Some(t) = touch {
+                if let Some(drag) = self.drag.take() {
+                    if let Some(l) = self.doc.layer_mut(drag.id) {
+                        *l = drag.start;
+                    }
+                    self.undo.pop();
+                }
+                self.panning = false;
+                ui.scroll_with_delta_animation(t.translation_delta, instant);
+            }
+
             let zoom = self.zoom;
             let size = Vec2::new(cw * zoom, ch * zoom) + margin * 2.0;
             let size = size.max(ui.available_size());
@@ -1882,14 +2090,7 @@ impl App {
             let to_canvas = |p: Pos2| ((p - origin) / zoom).to_pos2();
             let canvas_rect = Rect::from_min_size(origin, Vec2::new(cw, ch) * zoom);
             let painter = ui.painter_at(area);
-
-            // Zoom con ⌘+rueda o pellizco.
-            if resp.hovered() {
-                let dz = ctx.input(|i| i.zoom_delta());
-                if dz != 1.0 {
-                    self.zoom = (self.zoom * dz).clamp(ZOOM_MIN, ZOOM_MAX);
-                }
-            }
+            self.last_origin = Some(origin);
 
             // Sombra, fondo y capas (recortadas al lienzo).
             painter.rect_filled(canvas_rect.translate(Vec2::new(0.0, 6.0)).expand(2.0), 4.0, Color32::from_black_alpha(90));
@@ -1939,8 +2140,8 @@ impl App {
                 painter.line_segment([a, b], Stroke::new(1.0, Color32::from_rgb(0, 200, 255)));
             }
 
-            // Selección.
-            let handle = 12.0;
+            // Selección. Con el dedo, tiradores más grandes y más fáciles de atinar.
+            let (handle, grab, edge_t) = if sys::WEB { (18.0, 12.0, 9.0) } else { (12.0, 6.0, 6.0) };
             // Las capas bloqueadas u ocultas se ven seleccionadas pero sin tiradores.
             let sel = self.selected.and_then(|id| self.doc.layers.iter().find(|l| l.id == id)).cloned();
             let sel_editable = sel.as_ref().is_some_and(|l| !l.locked && !l.hidden);
@@ -1981,7 +2182,7 @@ impl App {
             if let Some(r) = sel_rect.filter(|_| sel_editable) {
                 painter.rect_stroke(r, 0.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
                 if sel_has_edges {
-                    for (_, h) in edge_handles(r) {
+                    for (_, h) in edge_handles(r, edge_t) {
                         painter.rect_filled(h, 3.0, Color32::WHITE);
                         painter.rect_stroke(h, 3.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
                     }
@@ -1993,10 +2194,10 @@ impl App {
 
             // ----- interacción -----
             let on_corner =
-                |p: Pos2| sel_editable && sel_rect.is_some_and(|r| Rect::from_center_size(r.max, Vec2::splat(handle + 6.0)).contains(p));
+                |p: Pos2| sel_editable && sel_rect.is_some_and(|r| Rect::from_center_size(r.max, Vec2::splat(handle + grab)).contains(p));
             let on_edge = |p: Pos2| -> Option<Edge> {
                 let r = sel_rect.filter(|_| sel_has_edges)?;
-                edge_handles(r).into_iter().find(|(_, h)| h.expand(6.0).contains(p)).map(|(e, _)| e)
+                edge_handles(r, edge_t).into_iter().find(|(_, h)| h.expand(grab).contains(p)).map(|(e, _)| e)
             };
             let hit = |doc: &Doc, p: Pos2| -> Option<u64> {
                 let c = to_canvas(p);
@@ -2029,11 +2230,13 @@ impl App {
                     self.focus_slide = ((c.x / sw).floor().max(0.0) as u32).min(self.doc.slides - 1);
                 }
             }
-            if resp.drag_started() {
+            if resp.drag_started() && touch.is_none() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let corner = on_corner(p);
                     let edge = if corner { None } else { on_edge(p) };
                     let target = if corner || edge.is_some() { self.selected } else { hit(&self.doc, p) };
+                    // «Mover dentro del recorte» actúa sobre la foto ya seleccionada.
+                    let pan = command || (self.pan_crop_mode && target.is_some() && target == self.selected);
                     self.selected = target;
                     if let Some(id) = target {
                         let start = self.doc.layers.iter().find(|l| l.id == id).unwrap().clone();
@@ -2041,11 +2244,14 @@ impl App {
                             _ if corner => DragMode::Resize,
                             Some(e) if start.is_stretchy() => DragMode::Stretch(e),
                             Some(e) => DragMode::Crop(e),
-                            None if command && start.is_media() => DragMode::Pan,
+                            None if pan && start.is_media() => DragMode::Pan,
                             None => DragMode::Move,
                         };
                         self.checkpoint();
                         self.drag = Some(Drag { mode, id, start, start_pointer: to_canvas(p) });
+                    } else {
+                        // Arrastrar el fondo desplaza el lienzo.
+                        self.panning = true;
                     }
                 }
             } else if resp.clicked() {
@@ -2145,8 +2351,12 @@ impl App {
                     *l = new;
                 }
             }
+            if self.panning && resp.dragged() && touch.is_none() {
+                ui.scroll_with_delta_animation(resp.drag_delta(), instant);
+            }
             if resp.drag_stopped() {
                 self.drag = None;
+                self.panning = false;
             }
 
             // Menú contextual: acciones de la capa y del slide bajo el puntero.
@@ -2212,32 +2422,39 @@ impl App {
                 }
             });
 
-            if resp.hovered() && self.doc.layers.is_empty() && self.pending == 0 {
+            if (resp.hovered() || sys::WEB) && self.doc.layers.is_empty() && self.pending == 0 {
                 painter.text(
                     canvas_rect.center(),
                     Align2::CENTER_CENTER,
-                    "Suelta aquí tus fotos",
+                    if sys::WEB { "Toca «＋ Fotos» para empezar" } else { "Suelta aquí tus fotos" },
                     FontId::proportional(18.0),
                     Color32::from_gray(150),
                 );
             }
 
-            // Fotos soltadas sobre la ventana.
-            let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+            // Fotos soltadas sobre la ventana (en iPad, arrastradas desde Fotos o Archivos).
+            let dropped: Vec<egui::DroppedFileHandle> = ctx.input(|i| {
+                i.raw.dropped_files.iter().filter(|f| !f.path().as_os_str().is_empty() && is_supported(f.path())).cloned().collect()
+            });
             if !dropped.is_empty() {
-                let images: Vec<PathBuf> = dropped.into_iter().filter(|p| is_supported(p)).collect();
                 let pointer = ctx.input(|i| i.pointer.hover_pos());
-                match pointer.filter(|p| canvas_rect.contains(*p)) {
-                    Some(p) if images.len() == 1 => {
-                        let c = to_canvas(p);
-                        let slide = ((c.x / sw).floor().max(0.0) as u32).min(self.doc.slides - 1);
-                        // Slide vacío → la foto lo rellena; si ya hay foto, se coloca donde la soltaste.
-                        let occupied =
-                            self.doc.layers.iter().any(|l| l.is_media() && self.doc.slide_of(l) == slide);
-                        let place = if occupied { Place::At(c.x, c.y) } else { Place::Slide(slide) };
-                        self.request_load(images[0].clone(), place, &ctx);
+                // Una sola foto sobre el lienzo: slide vacío → lo rellena; si ya
+                // hay foto, se coloca donde la soltaste.
+                let place = pointer.filter(|p| canvas_rect.contains(*p) && dropped.len() == 1).map(|p| {
+                    let c = to_canvas(p);
+                    let slide = ((c.x / sw).floor().max(0.0) as u32).min(self.doc.slides - 1);
+                    let occupied = self.doc.layers.iter().any(|l| l.is_media() && self.doc.slide_of(l) == slide);
+                    if occupied { Place::At(c.x, c.y) } else { Place::Slide(slide) }
+                });
+                #[cfg(target_arch = "wasm32")]
+                self.web_drop(dropped, place, &ctx);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let paths: Vec<PathBuf> = dropped.iter().map(|f| f.path().to_path_buf()).collect();
+                    match place {
+                        Some(place) => self.request_load(paths[0].clone(), place, &ctx),
+                        None => self.add_media(paths, &ctx),
                     }
-                    _ => self.add_media(images, &ctx),
                 }
             }
             let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -2248,15 +2465,16 @@ impl App {
     }
 }
 
-/// Tiradores de recorte en el centro de cada lado del marco (en pantalla).
-fn edge_handles(r: Rect) -> [(Edge, Rect); 4] {
-    let long_x = (r.width() * 0.4).clamp(6.0, 28.0);
-    let long_y = (r.height() * 0.4).clamp(6.0, 28.0);
+/// Tiradores de recorte en el centro de cada lado del marco (en pantalla),
+/// de grosor `t`.
+fn edge_handles(r: Rect, t: f32) -> [(Edge, Rect); 4] {
+    let long_x = (r.width() * 0.4).clamp(t, 28.0 * t / 6.0);
+    let long_y = (r.height() * 0.4).clamp(t, 28.0 * t / 6.0);
     [
-        (Edge::Left, Rect::from_center_size(Pos2::new(r.min.x, r.center().y), Vec2::new(6.0, long_y))),
-        (Edge::Right, Rect::from_center_size(Pos2::new(r.max.x, r.center().y), Vec2::new(6.0, long_y))),
-        (Edge::Top, Rect::from_center_size(Pos2::new(r.center().x, r.min.y), Vec2::new(long_x, 6.0))),
-        (Edge::Bottom, Rect::from_center_size(Pos2::new(r.center().x, r.max.y), Vec2::new(long_x, 6.0))),
+        (Edge::Left, Rect::from_center_size(Pos2::new(r.min.x, r.center().y), Vec2::new(t, long_y))),
+        (Edge::Right, Rect::from_center_size(Pos2::new(r.max.x, r.center().y), Vec2::new(t, long_y))),
+        (Edge::Top, Rect::from_center_size(Pos2::new(r.center().x, r.min.y), Vec2::new(long_x, t))),
+        (Edge::Bottom, Rect::from_center_size(Pos2::new(r.center().x, r.max.y), Vec2::new(long_x, t))),
     ]
 }
 
@@ -2298,6 +2516,8 @@ impl eframe::App for App {
             self.coalesce = false;
         }
 
+        #[cfg(target_arch = "wasm32")]
+        self.web_frame(&ctx);
         self.receive_loads(&ctx);
         self.sync_video_players(&ctx);
         self.poll_export(&ctx);
@@ -2306,6 +2526,9 @@ impl eframe::App for App {
         self.sync_text_bounds();
 
         let title = format!("{}{} — Carrusel", if self.dirty { "• " } else { "" }, self.doc_name());
+        #[cfg(target_arch = "wasm32")]
+        sys::set_title(&title);
+        #[cfg(not(target_arch = "wasm32"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -2318,6 +2541,8 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(Color32::from_rgb(52, 36, 46)).inner_margin(egui::Margin::symmetric(10, 6)))
                 .show(ui, |ui| self.update_banner(ui));
         }
+        #[cfg(target_arch = "wasm32")]
+        self.web_banner(ui);
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.pending > 0 || self.exporting.is_some() {

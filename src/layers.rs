@@ -15,6 +15,9 @@ pub struct LayersUi {
     focus_rename: bool,
     /// Mostrar solo las capas del slide actual.
     only_slide: bool,
+    /// Alto real de los botones de abajo en el fotograma anterior (con
+    /// controles táctiles ocupan más y pueden partirse en dos líneas).
+    footer_h: f32,
 }
 
 const ROW_H: f32 = 34.0;
@@ -83,7 +86,8 @@ impl App {
             .filter(|&i| !self.layers_ui.only_slide || self.doc.slide_of(&self.doc.layers[i]) == slide)
             .collect();
 
-        let footer_h = 30.0;
+        // Si la lista no deja sitio exacto a los botones, el panel crece solo.
+        let footer_h = self.layers_ui.footer_h.max(30.0);
         let list_h = (ui.available_height() - footer_h).max(ROW_H);
         let mut rows: Vec<(usize, Rect)> = Vec::new();
         let mut select = None;
@@ -218,6 +222,7 @@ impl App {
         }
 
         // Botones inferiores, como en Photoshop.
+        let footer_top = ui.cursor().min.y;
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             let has = self.selected.and_then(|id| self.doc.index_of(id));
@@ -251,6 +256,7 @@ impl App {
                 self.delete_selected();
             }
         });
+        self.layers_ui.footer_h = ui.cursor().min.y - footer_top;
     }
 
     /// Mueve una capa justo encima (`above`) o debajo de la capa en `target_idx`

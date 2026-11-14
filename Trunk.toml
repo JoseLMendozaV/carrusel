@@ -1,0 +1,11 @@
+# Versión web: `trunk serve` para probar, `trunk build --release` para publicar.
+[build]
+target = "index.html"
+# No usar «dist»: ahí vive Carrusel.app y Trunk vacía su carpeta al compilar.
+dist = "dist-web"
+public_url = "./"
+
+[serve]
+# Accesible desde el iPad en la misma red Wi-Fi (http://<IP de la Mac>:8080).
+addresses = ["0.0.0.0"]
+port = 8080

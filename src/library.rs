@@ -2,10 +2,11 @@
 //! (Iconify), ilustraciones (FreeSVG), formas, marcos y estilos de texto.
 
 use crate::doc::{EmojiStyle, FrameKind, Kind, ShapeKind, TextAlign};
-use crate::{online, scrapbook, vector};
+use crate::{online, scrapbook, sys, vector};
 use std::sync::mpsc;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, TextureHandle, Vec2};
 use std::collections::HashMap;
+use std::future::Future;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -52,7 +53,9 @@ enum Online {
     Icons { query: String, start: usize, result: Result<(Vec<String>, bool, HashMap<String, String>), String> },
     Login(Result<String, String>),
     Free { query: String, page: u32, result: Result<(Vec<online::FreeSvgItem>, bool), String> },
-    FreeThumb { id: u64, image: Option<image::RgbaImage> },
+    /// Miniatura de una ilustración; en la web viene del propio SVG (que
+    /// también se guarda, así añadirla es inmediato).
+    FreeThumb { id: u64, image: Option<image::RgbaImage>, svg: Option<String> },
     FreeSvg { result: Result<(String, String, u64), String> },
 }
 
@@ -81,6 +84,8 @@ struct FreeSearch {
     downloading: Option<u64>,
     error: Option<String>,
     thumbs: HashMap<u64, TextureHandle>,
+    /// SVG ya descargados y limpios (en la web, junto con la miniatura).
+    svgs: HashMap<u64, (String, String)>,
     /// Miniaturas que no se pudieron descargar (para no mostrar «cargando» siempre).
     failed_thumbs: std::collections::HashSet<u64>,
 }
@@ -186,7 +191,7 @@ impl Library {
             Tab::Emoji => self.emoji_tab(ui, &mut action),
             Tab::Stickers => self.stickers_tab(ui, &mut action),
             Tab::Icons => self.icons_tab(ui, &mut action),
-            Tab::Illustrations => self.illustrations_tab(ui),
+            Tab::Illustrations => self.illustrations_tab(ui, &mut action),
             Tab::Shapes => self.shapes_tab(ui, &mut action),
             Tab::Frames => self.frames_tab(ui, &mut action),
             Tab::Text => {
@@ -279,10 +284,10 @@ impl Library {
 
     // ----- búsquedas en línea --------------------------------------------
 
-    fn spawn(&self, ctx: &egui::Context, job: impl FnOnce() -> Online + Send + 'static) {
+    fn spawn(&self, ctx: &egui::Context, job: impl Future<Output = Online> + sys::MaybeSend + 'static) {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(job());
+        sys::spawn(async move {
+            let _ = tx.send(job.await);
             ctx.request_repaint();
         });
     }
@@ -328,14 +333,14 @@ impl Library {
                             if page == 1 {
                                 self.free.items.clear();
                             }
-                            // Miniaturas (PNG públicos) de esta página, en 5 hilos.
-                            let thumbs: Vec<(u64, String)> = items.iter().map(|i| (i.id, i.thumb.clone())).collect();
-                            for chunk in thumbs.chunks(5) {
-                                let (tx, c, chunk) = (self.tx.clone(), ctx.clone(), chunk.to_vec());
-                                std::thread::spawn(move || {
-                                    for (id, url) in chunk {
-                                        let image = online::get(&url).ok().and_then(|b| image::load_from_memory(&b).ok()).map(|i| i.to_rgba8());
-                                        let _ = tx.send(Online::FreeThumb { id, image });
+                            // Miniaturas de esta página, en 5 tandas a la vez.
+                            let token = self.free.token.clone().unwrap_or_default();
+                            for chunk in items.chunks(5) {
+                                let (tx, c, chunk, token) = (self.tx.clone(), ctx.clone(), chunk.to_vec(), token.clone());
+                                sys::spawn(async move {
+                                    for item in chunk {
+                                        let (image, svg) = free_thumb(&token, &item).await;
+                                        let _ = tx.send(Online::FreeThumb { id: item.id, image, svg });
                                         c.request_repaint();
                                     }
                                 });
@@ -354,7 +359,10 @@ impl Library {
                         }
                     }
                 }
-                Online::FreeThumb { id, image } => {
+                Online::FreeThumb { id, image, svg } => {
+                    if let (Some(svg), Some(item)) = (svg, self.free.items.iter().find(|i| i.id == id)) {
+                        self.free.svgs.insert(id, (svg, item_name(item)));
+                    }
                     if image.is_none() {
                         self.free.failed_thumbs.insert(id);
                     }
@@ -384,11 +392,14 @@ impl Library {
         }
         self.icons.query = query.clone();
         self.icons.loading = true;
-        self.spawn(ctx, move || {
-            let result = online::search_icons(&query, start).map(|(names, more)| {
-                let svgs = online::icon_svgs(&names);
-                (names.into_iter().filter(|n| svgs.contains_key(n)).collect(), more, svgs)
-            });
+        self.spawn(ctx, async move {
+            let result = match online::search_icons(&query, start).await {
+                Ok((names, more)) => {
+                    let svgs = online::icon_svgs(&names).await;
+                    Ok((names.into_iter().filter(|n| svgs.contains_key(n)).collect(), more, svgs))
+                }
+                Err(e) => Err(e),
+            };
             Online::Icons { query, start, result }
         });
     }
@@ -400,7 +411,10 @@ impl Library {
         }
         self.free.query = query.clone();
         self.free.loading = true;
-        self.spawn(ctx, move || Online::Free { query: query.clone(), page, result: online::freesvg_search(&token, &query, page) });
+        self.spawn(ctx, async move {
+            let result = online::freesvg_search(&token, &query, page).await;
+            Online::Free { query, page, result }
+        });
     }
 
     // ----- pestañas -------------------------------------------------------
@@ -501,7 +515,7 @@ impl Library {
     }
 
     /// Las ilustraciones se añaden al terminar de descargarse (ver `receive`).
-    fn illustrations_tab(&mut self, ui: &mut egui::Ui) {
+    fn illustrations_tab(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
         let ctx = ui.ctx().clone();
         ui.weak("Ilustraciones de FreeSVG.org: dominio público (CC0), libres para cualquier uso.");
         if let Some(e) = &self.free.error {
@@ -517,7 +531,7 @@ impl Library {
                 if ui.add_enabled(ready, egui::Button::new("Entrar")).clicked() {
                     let (email, password) = (self.free.email.trim().to_string(), std::mem::take(&mut self.free.password));
                     self.free.loading = true;
-                    self.spawn(&ctx, move || Online::Login(online::freesvg_login(&email, &password)));
+                    self.spawn(&ctx, async move { Online::Login(online::freesvg_login(&email, &password).await) });
                 }
                 if self.free.loading {
                     ui.spinner();
@@ -569,15 +583,23 @@ impl Library {
             };
             resp.on_hover_text(label).clicked()
         });
+        // Ya descargada (en la web, con su miniatura): se añade al momento.
+        if let Some(id) = picked.map(|i| items[i].id) {
+            if let Some((svg, name)) = self.free.svgs.get(&id) {
+                *action = Some(Action::Graphic { svg: svg.clone(), source: format!("freesvg:{id}"), name: name.clone(), tint: None });
+                return;
+            }
+        }
         if let (Some(i), None, Some(token)) = (picked, self.free.downloading, self.free.token.clone()) {
             let item = items[i].clone();
             self.free.downloading = Some(item.id);
-            self.spawn(&ctx, move || {
-                let result = online::freesvg_download(&token, &item.svg).and_then(|raw| {
-                    let svg = vector::sanitize_svg(&raw).ok_or("La ilustración no se puede dibujar (SVG no compatible).")?;
-                    let name = if item.title.is_empty() { format!("Ilustración {}", item.id) } else { item.title.clone() };
-                    Ok((svg, name, item.id))
-                });
+            self.spawn(&ctx, async move {
+                let result = match online::freesvg_download(&token, &item.svg).await {
+                    Ok(raw) => vector::sanitize_svg(&raw)
+                        .ok_or_else(|| "La ilustración no se puede dibujar (SVG no compatible).".to_string())
+                        .map(|svg| (svg, item_name(&item), item.id)),
+                    Err(e) => Err(e),
+                };
                 Online::FreeSvg { result }
             });
         }
@@ -698,4 +720,28 @@ fn fit_box(aspect: f32, side: f32) -> (f32, f32) {
 fn graphic_svg(svg: &str, tint: Option<[u8; 4]>, w: f32, h: f32) -> Option<String> {
     let kind = Kind::Graphic { svg: svg.to_string(), source: String::new(), name: String::new(), tint, sticker: false };
     vector::layer_svg(&kind, w, h)
+}
+
+fn item_name(item: &online::FreeSvgItem) -> String {
+    if item.title.is_empty() { format!("Ilustración {}", item.id) } else { item.title.clone() }
+}
+
+/// Miniatura de una ilustración de FreeSVG: el PNG público en escritorio. En
+/// la web el navegador no deja leer ese PNG (FreeSVG no lo permite desde otras
+/// páginas), así que se dibuja el propio SVG, que sí se puede descargar.
+#[cfg(not(target_arch = "wasm32"))]
+async fn free_thumb(_token: &str, item: &online::FreeSvgItem) -> (Option<image::RgbaImage>, Option<String>) {
+    let image = online::get(&item.thumb).await.ok().and_then(|b| image::load_from_memory(&b).ok()).map(|i| i.to_rgba8());
+    (image, None)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn free_thumb(token: &str, item: &online::FreeSvgItem) -> (Option<image::RgbaImage>, Option<String>) {
+    let Some(svg) = online::freesvg_download(token, &item.svg).await.ok().and_then(|raw| vector::sanitize_svg(&raw)) else {
+        return (None, None);
+    };
+    sys::yield_now().await;
+    let (w, h) = fit_box(vector::svg_aspect(&svg), 128.0);
+    let image = graphic_svg(&svg, None, w, h).and_then(|s| vector::rasterize(&s, 1.0, (0.0, 0.0), (w as u32, h as u32)));
+    (image, Some(svg))
 }
