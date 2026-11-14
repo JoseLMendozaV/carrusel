@@ -6,9 +6,11 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 mod doc;
+mod fonts;
 mod layers;
 mod library;
 mod online;
+mod project;
 mod render;
 mod scrapbook;
 mod sys;
@@ -244,6 +246,11 @@ struct App {
     pan_crop_mode: bool,
     /// Se está desplazando el lienzo arrastrando el fondo.
     panning: bool,
+    /// Catálogo de Google Fonts.
+    font_picker: fonts::FontPicker,
+    /// «Guardar» escribe el proyecto con las fotos dentro (porque se abrió
+    /// así o se eligió «Guardar con fotos…»).
+    save_bundle: bool,
     /// Origen del lienzo en pantalla en el fotograma anterior (para hacer
     /// zoom alrededor del puntero o de los dedos).
     last_origin: Option<Pos2>,
@@ -311,6 +318,8 @@ impl App {
             },
             pan_crop_mode: false,
             panning: false,
+            font_picker: fonts::FontPicker::default(),
+            save_bundle: false,
             last_origin: None,
             #[cfg(target_arch = "wasm32")]
             web: web_app::WebState::default(),
@@ -503,12 +512,10 @@ impl App {
         if !self.dirty || (self.path.is_none() && self.doc.layers.is_empty()) {
             return true;
         }
+        // En la web todo se guarda solo en la lista de proyectos.
         #[cfg(target_arch = "wasm32")]
         {
-            sys::confirm(&format!(
-                "«{}» tiene cambios que no guardaste en un archivo.\n\n¿Descartarlos? (Cancela y toca «Guardar» si quieres conservar una copia.)",
-                self.doc_name()
-            ))
+            true
         }
         #[cfg(not(target_arch = "wasm32"))]
         self.confirm_discard_native()
@@ -894,9 +901,19 @@ impl App {
     // ----- archivos --------------------------------------------------------
 
     fn new_doc(&mut self, ctx: &egui::Context) {
+        // En la web el proyecto actual queda guardado en la lista: no se pierde nada.
+        #[cfg(target_arch = "wasm32")]
+        self.web_new_project(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.new_doc_native(ctx);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new_doc_native(&mut self, ctx: &egui::Context) {
         if !self.confirm_discard() {
             return;
         }
+        self.save_bundle = false;
         self.checkpoint();
         self.doc = Doc::default();
         self.path = None;
@@ -921,13 +938,20 @@ impl App {
         let Some(path) = rfd::FileDialog::new().add_filter("Proyecto Carrusel", &["carrusel"]).pick_file() else {
             return;
         };
-        match std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<Doc>(&s).map_err(|e| e.to_string()))
-        {
-            Ok(doc) => {
-                self.set_doc(doc, Some(path.clone()), ctx);
-                self.status = format!("Abierto {}", path.display());
+        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| project::parse(&b)) {
+            Ok(opened) => {
+                let bundle = opened.bundle;
+                match unpack_project(opened, &path) {
+                    Ok((doc, unpacked)) => {
+                        self.set_doc(doc, Some(path.clone()), ctx);
+                        self.save_bundle = bundle;
+                        self.status = match unpacked {
+                            Some(dir) => format!("Abierto {}. Sus fotos están en «{}».", path.display(), dir.display()),
+                            None => format!("Abierto {}", path.display()),
+                        };
+                    }
+                    Err(e) => self.status = format!("No se pudo abrir el proyecto: {e}"),
+                }
             }
             Err(e) => self.status = format!("No se pudo abrir el proyecto: {e}"),
         }
@@ -981,15 +1005,53 @@ impl App {
                 None => return,
             },
         };
-        match serde_json::to_string_pretty(&self.doc).map_err(|e| e.to_string()).and_then(|s| {
-            std::fs::write(&path, s).map_err(|e| e.to_string())
-        }) {
-            Ok(()) => {
-                self.status = format!("Guardado en {}", path.display());
+        let saved = if self.save_bundle {
+            project::bundle(&self.doc, |p| std::fs::read(p).ok()).and_then(|(bytes, left)| {
+                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+                Ok(left)
+            })
+        } else {
+            serde_json::to_string_pretty(&self.doc)
+                .map_err(|e| e.to_string())
+                .and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string()))
+                .map(|_| project::Left::default())
+        };
+        match saved {
+            Ok(left) => {
+                let mut msg = if self.save_bundle {
+                    format!("Guardado con sus fotos en {} (se abre igual en el iPad).", path.display())
+                } else {
+                    format!("Guardado en {}", path.display())
+                };
+                if !left.videos.is_empty() {
+                    msg += &format!(" Los {} video(s) no van dentro: siguen enlazados en esta Mac.", left.videos.len());
+                }
+                if !left.missing.is_empty() {
+                    msg += &format!(" No se encontraron {} archivo(s).", left.missing.len());
+                }
+                self.status = msg;
                 self.path = Some(path);
                 self.dirty = false;
             }
             Err(e) => self.status = format!("No se pudo guardar: {e}"),
+        }
+    }
+
+    /// Guarda un único .carrusel con las fotos y la fuente dentro, para
+    /// abrirlo en el iPad (versión web) o en otra Mac.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_with_photos(&mut self) {
+        let name = format!("{}.carrusel", self.doc_name());
+        let Some(path) = rfd::FileDialog::new().add_filter("Proyecto Carrusel", &["carrusel"]).set_file_name(name).save_file() else {
+            return;
+        };
+        let previous = std::mem::replace(&mut self.save_bundle, true);
+        let old_path = self.path.replace(path);
+        self.save_native(false);
+        if self.dirty {
+            // No se pudo guardar: todo queda como estaba.
+            self.save_bundle = previous;
+            self.path = old_path;
         }
     }
 
@@ -1201,12 +1263,22 @@ impl App {
             if ui.button("Nuevo").on_hover_text("⌘N").clicked() {
                 self.new_doc(&ctx);
             }
-            if ui.button("Abrir…").on_hover_text("⌘O").clicked() {
+            let open_label = if sys::WEB { "Proyectos…" } else { "Abrir…" };
+            let open_tip = if sys::WEB { "Tus proyectos guardados en este navegador, e importar un .carrusel (⌘O)" } else { "⌘O" };
+            if ui.button(open_label).on_hover_text(open_tip).clicked() {
                 self.open(&ctx);
             }
             let save_tip = if sys::WEB { "Descarga el proyecto (.carrusel) con sus fotos, para tener una copia" } else { "⌘S" };
             if ui.button("Guardar").on_hover_text(save_tip).clicked() {
                 self.save(false);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui
+                .button("Guardar con fotos…")
+                .on_hover_text("Un solo archivo con las fotos y la fuente dentro, para abrirlo en el iPad o en otra Mac")
+                .clicked()
+            {
+                self.save_with_photos();
             }
             ui.separator();
             if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Deshacer")).on_hover_text("⌘Z").clicked() {
@@ -1383,17 +1455,20 @@ impl App {
                 .doc
                 .font
                 .as_ref()
-                .and_then(|p| p.file_name())
+                .and_then(|p| p.file_stem())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Ubuntu Light (integrada)".into());
             ui.label(name);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Google Fonts…").on_hover_text("Unas 1.900 familias gratuitas, con buscador y muestra").clicked() {
+                    self.font_picker.open = true;
+                }
                 #[cfg(target_arch = "wasm32")]
-                if ui.button("Elegir fuente…").on_hover_text("Un archivo .ttf, .otf o .ttc de Archivos").clicked() {
+                if ui.button("Archivo…").on_hover_text("Un archivo .ttf, .otf o .ttc de Archivos").clicked() {
                     self.web_pick_font(&ctx);
                 }
                 #[cfg(not(target_arch = "wasm32"))]
-                if ui.button("Elegir fuente…").clicked() {
+                if ui.button("Archivo…").on_hover_text("Cualquier fuente .ttf, .otf o .ttc de tu Mac").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("Fuentes", &["ttf", "otf", "ttc"]).pick_file() {
                         self.checkpoint();
                         self.doc.font = Some(p);
@@ -1426,7 +1501,7 @@ impl App {
                 ui.weak("Con teclado también funcionan los atajos de la Mac (⌘Z, ⌘D, ⌫, flechas…).");
                 ui.add_space(14.0);
                 ui.label(egui::RichText::new(format!("Carrusel {} · web", updater::current_version())).strong());
-                ui.weak("Tu proyecto se guarda solo en este navegador mientras trabajas. Toca «Guardar» para tener una copia en Archivos.");
+                ui.weak("Tus proyectos se guardan solos en este navegador (míralos en «Proyectos…»). «Guardar» descarga una copia con las fotos dentro, que también abre la app de la Mac.");
                 return;
             }
             ui.label(egui::RichText::new("Atajos").strong());
@@ -2579,6 +2654,19 @@ impl eframe::App for App {
             ui.add_space(8.0);
             egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
         });
+        if let Some(picked) = self.font_picker.ui(&ctx) {
+            match sys::save_font(&picked.file_name, picked.bytes) {
+                Ok(path) => {
+                    self.checkpoint();
+                    self.doc.font = Some(path);
+                    self.sync_font(&ctx);
+                    self.status = format!("Fuente: {}", picked.file_name.trim_end_matches(".ttf"));
+                }
+                Err(e) => self.status = format!("No se pudo guardar la fuente: {e}"),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.projects_window(&ctx);
         egui::CentralPanel::no_frame()
             .frame(egui::Frame::NONE.fill(Color32::from_gray(28)))
             .show(ui, |ui| {
@@ -2588,5 +2676,74 @@ impl eframe::App for App {
                     self.canvas(ui);
                 }
             });
+    }
+}
+
+/// Abre un proyecto en la Mac. Si trae las fotos dentro (por ejemplo, hecho
+/// en el iPad), las guarda en una carpeta junto al proyecto, «<nombre> fotos»,
+/// y apunta el documento a ellas. Las que ya están en su sitio en esta Mac se
+/// usan tal cual. Devuelve el documento y la carpeta, si se creó.
+#[cfg(not(target_arch = "wasm32"))]
+fn unpack_project(opened: project::Opened, path: &Path) -> Result<(Doc, Option<PathBuf>), String> {
+    let mut doc = opened.doc;
+    if opened.files.is_empty() {
+        return Ok((doc, None));
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "proyecto".into());
+    let dir = path.with_file_name(format!("{stem} fotos"));
+    let mut map: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for (original, data) in opened.files {
+        let same = original.is_absolute() && std::fs::read(&original).is_ok_and(|d| d == data);
+        if same {
+            continue;
+        }
+        let target = dir.join(project::unpacked_name(&original, &data));
+        if !std::fs::read(&target).is_ok_and(|d| d == data) {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("no se pudo crear «{}»: {e}", dir.display()))?;
+            std::fs::write(&target, &data).map_err(|e| e.to_string())?;
+        }
+        map.insert(original, target);
+    }
+    project::remap_files(&mut doc, &|p: &Path| map.get(p).cloned());
+    Ok((doc, (!map.is_empty()).then_some(dir)))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use doc::Layer;
+
+    #[test]
+    fn abre_en_la_mac_un_proyecto_hecho_en_el_ipad() {
+        let dir = std::env::temp_dir().join("carrusel_desde_ipad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Dos fotos del iPad con el mismo nombre y una fuente.
+        let mut doc = Doc::default();
+        doc.layers.push(Layer::new(1, Kind::Image { path: "web/aaaa/image.jpg".into() }, (0.0, 0.0, 10.0, 10.0)));
+        doc.layers.push(Layer::new(2, Kind::Image { path: "web/bbbb/image.jpg".into() }, (0.0, 0.0, 10.0, 10.0)));
+        doc.font = Some("web/cccc/Roboto Negrita.ttf".into());
+        let read = |p: &Path| Some(p.to_string_lossy().as_bytes().to_vec());
+        let (bytes, _) = project::bundle(&doc, read).unwrap();
+        let file = dir.join("viaje.carrusel");
+        std::fs::write(&file, &bytes).unwrap();
+
+        let opened = project::parse(&std::fs::read(&file).unwrap()).unwrap();
+        let (doc, folder) = unpack_project(opened, &file).unwrap();
+        assert_eq!(folder, Some(dir.join("viaje fotos")));
+        let files = project::doc_files(&doc);
+        assert_eq!(files.len(), 3, "las dos «image.jpg» no se pisan");
+        for f in &files {
+            assert!(f.starts_with(dir.join("viaje fotos")), "{}", f.display());
+            assert!(f.is_file());
+        }
+        // Volver a abrirlo no duplica nada y guardarlo con fotos sigue funcionando.
+        let again = unpack_project(project::parse(&bytes).unwrap(), &file).unwrap().0;
+        assert_eq!(project::doc_files(&again), files);
+        let (resaved, left) = project::bundle(&again, |p| std::fs::read(p).ok()).unwrap();
+        assert!(left.missing.is_empty());
+        let (back, _) = unpack_project(project::parse(&resaved).unwrap(), &file).unwrap();
+        assert_eq!(project::doc_files(&back), files, "en la misma Mac usa las fotos que ya están");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

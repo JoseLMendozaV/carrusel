@@ -12,6 +12,16 @@ pub fn spawn(fut: impl Future<Output = ()> + MaybeSend + 'static) {
     std::thread::spawn(move || pollster::block_on(fut));
 }
 
+/// Guarda una fuente descargada en la carpeta de datos y devuelve su ruta.
+pub fn save_font(name: &str, bytes: Vec<u8>) -> Result<PathBuf, String> {
+    let dir = data_dir().join("fuentes");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let clean: String = name.chars().map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c }).collect();
+    let path = dir.join(clean);
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 pub fn read(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
 }

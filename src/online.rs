@@ -13,7 +13,7 @@ pub async fn get(url: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Descarga con caché (los iconos no cambian).
-async fn cached_get(key: &str, url: &str, max_age_days: Option<u64>) -> Result<Vec<u8>, String> {
+pub(crate) async fn cached_get(key: &str, url: &str, max_age_days: Option<u64>) -> Result<Vec<u8>, String> {
     if let Some(data) = sys::cache_get(key, max_age_days) {
         return Ok(data);
     }

@@ -30,7 +30,8 @@ Trabajas sobre **un lienzo continuo** dividido en slides. Lo que cruce la línea
 - **Panel de Capas** (abajo a la derecha, como en Photoshop): todas las capas de la que está al frente a la del fondo, con miniatura y nombre. Clic para seleccionar, **arrastrar para cambiar el orden**, doble clic para renombrar, **ojo** para ocultar (no se ve ni se exporta) y **candado** para bloquear (no se puede seleccionar ni mover desde el lienzo, ideal para fondos). Botones para subir, bajar, duplicar, ocultar, bloquear y eliminar, y la opción «Solo este slide» para cuando hay muchos objetos.
 - Color de fondo, orden de capas, duplicar, deshacer/rehacer (un arrastre de deslizador o una edición de texto cuentan como un solo paso).
 - Avisa antes de cerrar, abrir otro proyecto o empezar uno nuevo si hay cambios sin guardar.
-- Proyectos guardables (`.carrusel`, JSON con rutas a tus fotos).
+- Proyectos guardables (`.carrusel`, JSON con rutas a tus fotos). **Guardar con fotos…** escribe un único `.carrusel` con las fotos y la fuente dentro, para abrirlo en el iPad (versión web) o en otra Mac. Al abrir en la Mac un proyecto así (por ejemplo, hecho en el iPad), sus fotos se guardan en una carpeta «<nombre> fotos» junto al proyecto, y «Guardar» lo sigue escribiendo con las fotos dentro. Los videos no van dentro: siguen enlazados.
+- **Google Fonts**: en Tipografía, «Google Fonts…» abre el catálogo (unas 1.900 familias con licencia libre) con buscador, categorías, grosor y cursiva, y cada familia escrita con su propia letra. La fuente elegida se descarga y se usa en todos los textos (en la Mac queda en la carpeta de datos de Carrusel; en la web, dentro del proyecto).
 - Exporta JPG (calidad 95) o PNG a resolución completa, más el panorama entero opcional. Cada slide se dibuja por separado, así la memoria no crece con el número de slides, y la barra de estado muestra el progreso. Con 100 o más slides los nombres llevan más ceros (`slide_001.jpg`) para que se ordenen bien; un panorama de más de 65 535 px de ancho se guarda en PNG porque JPG no lo admite. La exportación usa las fotos originales, no las miniaturas, y solo escala la parte visible de cada foto.
 - **Exportar para Instagram y TikTok**:
   - **Carrusel**: un archivo por slide; los slides con video salen como **MP4** (H.264 + AAC, 30 fps, hasta 60 s, con el sonido del video) y el resto como foto.
@@ -43,8 +44,10 @@ Carrusel también corre en el navegador, pensada para usarse en iPad con el dedo
 - **Instalarla en el iPad**: abre la página en Safari, toca **Compartir › Añadir a pantalla de inicio** y se abre a pantalla completa, como una app. Después funciona sin conexión.
 - **Fotos**: «＋ Fotos» abre la fototeca del iPad; también puedes arrastrarlas desde Fotos o Archivos en Split View. Entiende HEIC.
 - **Gestos**: pellizcar para el zoom, dos dedos (o arrastrar el fondo) para desplazar el lienzo y mantener pulsado en lugar del clic derecho. «Slide» en la barra inserta o quita slides; en el inspector, «Mover la foto dentro del recorte» sustituye a ⌘ + arrastrar.
-- **Guardado**: el proyecto y sus fotos se guardan solos en el navegador mientras trabajas. «Guardar» descarga un `.carrusel` con las fotos dentro (en iPad va a Archivos › Descargas) y «Abrir…» lo recupera.
-- **Exportar**: al terminar aparece **Guardar en Fotos / compartir**, que abre la hoja de compartir de iOS («Guardar imágenes», Instagram, AirDrop…), o **Descargar .zip**.
+- **Proyectos**: se guardan solos en el navegador mientras trabajas, cada uno con su miniatura. «Proyectos…» (⌘O) los lista para abrir, duplicar, renombrar o eliminar, e importar un `.carrusel`; «Nuevo» empieza otro sin perder el actual.
+- **Guardar**: descarga un `.carrusel` con las fotos y la fuente dentro (en iPad va a Archivos › Descargas). La app de la Mac lo abre tal cual.
+- **Exportar**: al terminar aparece **Guardar en Fotos / compartir**, que abre la hoja de compartir de iOS («Guardar imágenes», Instagram, AirDrop…), **Descargar .zip** o **Descargar uno por uno**.
+- **Atajos**: con teclado, ⌘S, ⌘O, ⌘N, ⌘E, ⌘D y ⌘Z hacen lo de Carrusel y no lo del navegador.
 - **Todavía no incluye**: videos (necesitan ffmpeg, que solo existe en la versión de escritorio) ni el video 9:16.
 
 Para compilarla hace falta [Trunk](https://trunk-rs.github.io/trunk) y el destino `wasm32`:
@@ -121,7 +124,9 @@ La app queda en `dist/Carrusel.app`. Para ponerle icono, deja un `icon.png` de 1
 - `src/render.rs` — carga de imágenes, texto con `ab_glyph` y exportación.
 - `src/vector.rs` — emojis, formas y marcos como SVG (dibujados con resvg).
 - `src/sys/` — lo que cambia entre escritorio y web (tareas, archivos, red, ajustes).
-- `src/web_app.rs` — versión web: guardado automático, abrir/guardar, exportar y compartir.
+- `src/web_app.rs` — versión web: proyectos en el navegador, importar/guardar, exportar y compartir.
+- `src/project.rs` — `.carrusel` con las fotos dentro, común a Mac y web.
+- `src/fonts.rs` — catálogo de Google Fonts (vía Fontsource, en TTF).
 - `src/video.rs` — videos con ffmpeg: información, reproducción y codificación MP4.
 - `src/library.rs` — panel de la biblioteca.
 - `src/layers.rs` — panel de capas (orden, visibilidad, bloqueo, nombres).

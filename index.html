@@ -80,7 +80,13 @@
     <p>Cargando Carrusel…</p>
   </div>
   <script>
-    // Evita el zoom de página de Safari al pellizcar (Carrusel hace el suyo).
+    // Los atajos de Carrusel (⌘S, ⌘O, ⌘N, ⌘E, ⌘D, ⌘Z) en lugar de los del navegador.
+    window.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && "sonedz".includes(e.key.toLowerCase()) && e.key.length === 1) {
+        e.preventDefault();
+      }
+    }, true);
+        // Evita el zoom de página de Safari al pellizcar (Carrusel hace el suyo).
     document.addEventListener("gesturestart", (e) => e.preventDefault());
     document.addEventListener("gesturechange", (e) => e.preventDefault());
     // Funciona sin conexión una vez cargada (solo en https).

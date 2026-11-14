@@ -3,14 +3,13 @@
 //! único archivo con sus fotos, y exportar para compartir (en iPad, «Guardar
 //! imágenes» en Fotos) o descargar en un .zip.
 
-use crate::doc::{Doc, Kind};
+use crate::doc::Doc;
 use crate::render::{self, ExportFormat};
-use crate::{sys, App, ExportMsg, Place, ACCENT};
-use base64::Engine;
-use eframe::egui::{self, Color32};
+use crate::{project, sys, App, ExportMsg, Place, ACCENT};
+use eframe::egui::{self, Color32, TextureHandle, Vec2};
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use wasm_bindgen::JsCast;
@@ -56,11 +55,19 @@ pub struct WebState {
     rx: mpsc::Receiver<Job>,
     ready: Option<Export>,
     can_share: bool,
-    /// El proyecto guardado ya se recuperó (antes no se guarda nada encima).
+    /// Ya se leyó la lista de proyectos (antes no se guarda nada encima).
     restored: bool,
+    /// Proyecto abierto y lista de proyectos (el más reciente primero).
+    current: String,
+    projects: Vec<Entry>,
+    show_projects: bool,
+    /// Proyecto que se está renombrando y el texto nuevo.
+    renaming: Option<(String, String)>,
     /// Último proyecto guardado (JSON) y fotos ya guardadas en el navegador.
     saved_json: String,
     saved_files: HashSet<PathBuf>,
+    /// Huella del proyecto cuando se hizo su miniatura.
+    thumb_for: u64,
     next_autosave: f64,
     autosave_scheduled: bool,
     layout_done: bool,
@@ -75,8 +82,13 @@ impl Default for WebState {
             ready: None,
             can_share: false,
             restored: false,
+            current: String::new(),
+            projects: Vec::new(),
+            show_projects: false,
+            renaming: None,
             saved_json: String::new(),
             saved_files: HashSet::new(),
+            thumb_for: 0,
             next_autosave: 0.0,
             autosave_scheduled: false,
             layout_done: false,
@@ -84,62 +96,164 @@ impl Default for WebState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Guardado automático (IndexedDB)
+fn hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
 
-const DOC_KEY: &str = "proyecto";
+/// Fecha y hora legibles («14/11/2026 11:30»).
+fn format_date(ms: f64) -> String {
+    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms));
+    format!("{}/{}/{} {:02}:{:02}", d.get_date(), d.get_month() + 1, d.get_full_year(), d.get_hours(), d.get_minutes())
+}
+
+// ---------------------------------------------------------------------------
+// Proyectos guardados en el navegador (IndexedDB)
+//
+//   proyecto:<id>   el documento (JSON)
+//   info:<id>       nombre, fecha y archivos que usa (JSON, para la lista)
+//   miniatura:<id>  PNG pequeño de los primeros slides
+//   archivo:<ruta>  fotos y fuentes, compartidas entre proyectos
+//   actual          el proyecto abierto
+
+const LEGACY_KEY: &str = "proyecto";
+const CURRENT_KEY: &str = "actual";
 const FILE_PREFIX: &str = "archivo:";
+const INFO_PREFIX: &str = "info:";
 
 fn file_key(path: &Path) -> String {
     format!("{FILE_PREFIX}{}", path.to_string_lossy())
 }
+fn doc_key(id: &str) -> String {
+    format!("proyecto:{id}")
+}
+fn info_key(id: &str) -> String {
+    format!("{INFO_PREFIX}{id}")
+}
+fn thumb_key(id: &str) -> String {
+    format!("miniatura:{id}")
+}
+
+fn new_id() -> String {
+    thread_local! {
+        static COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let n = COUNTER.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    format!("p{:x}{n:x}", sys::now_ms() as u64)
+}
 
 #[derive(Serialize)]
 struct SavedRef<'a> {
-    name: Option<&'a str>,
     dirty: bool,
     doc: &'a Doc,
 }
 
 #[derive(Deserialize)]
 struct Saved {
+    /// Solo en proyectos guardados por la primera versión web.
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     dirty: bool,
     doc: Doc,
 }
 
-/// Fotos, videos y fuente que usa el documento.
-fn doc_files(doc: &Doc) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = doc
-        .layers
-        .iter()
-        .filter_map(|l| match &l.kind {
-            Kind::Image { path } | Kind::Video { path, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .collect();
-    out.extend(doc.font.clone());
-    out.sort();
-    out.dedup();
-    out
+#[derive(Clone, Serialize, Deserialize)]
+struct Info {
+    name: String,
+    /// Milisegundos desde 1970.
+    modified: f64,
+    #[serde(default)]
+    files: Vec<String>,
 }
 
-/// Recupera el último proyecto y borra del navegador las fotos que ya no usa.
-async fn restore() -> Option<Saved> {
-    let saved: Option<Saved> = sys::db_get_text(DOC_KEY).await.and_then(|t| serde_json::from_str(&t).ok());
-    let wanted: HashSet<PathBuf> = saved.as_ref().map(|s| doc_files(&s.doc).into_iter().collect()).unwrap_or_default();
-    for p in &wanted {
-        if let Some(bytes) = sys::db_get_bytes(&file_key(p)).await {
-            sys::store_at(p.clone(), bytes);
+struct Entry {
+    id: String,
+    info: Info,
+    thumb_png: Option<Vec<u8>>,
+    thumb: Option<TextureHandle>,
+}
+
+fn file_list(doc: &Doc) -> Vec<String> {
+    project::doc_files(doc).iter().map(|p| p.to_string_lossy().into_owned()).collect()
+}
+
+/// Nombre válido para un proyecto (también es el nombre del archivo al guardarlo).
+fn clean_name(name: &str) -> String {
+    let n: String = name.trim().chars().map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c }).collect();
+    if n.is_empty() { "Sin título".into() } else { n }
+}
+
+fn spawn_write(write: impl std::future::Future<Output = bool> + 'static) {
+    sys::spawn(async move {
+        write.await;
+    });
+}
+
+/// Lista de proyectos (la más reciente primero) y el que estaba abierto. La
+/// primera vez convierte el proyecto único de la versión anterior.
+async fn load_index() -> (Vec<Entry>, Option<String>) {
+    if let Some(text) = sys::db_get_text(LEGACY_KEY).await {
+        if let Ok(saved) = serde_json::from_str::<Saved>(&text) {
+            let id = new_id();
+            let name = saved.name.as_deref().and_then(|n| Path::new(n).file_stem()).map(|s| s.to_string_lossy().into_owned());
+            let info = Info { name: clean_name(name.as_deref().unwrap_or("")), modified: sys::now_ms(), files: file_list(&saved.doc) };
+            sys::db_set_text(&doc_key(&id), &text).await;
+            sys::db_set_text(&info_key(&id), &serde_json::to_string(&info).unwrap_or_default()).await;
+            sys::db_set_text(CURRENT_KEY, &id).await;
+        }
+        sys::db_delete(LEGACY_KEY).await;
+    }
+    let mut entries = Vec::new();
+    for key in sys::db_keys().await {
+        let Some(id) = key.strip_prefix(INFO_PREFIX) else { continue };
+        let Some(info) = sys::db_get_text(&key).await.and_then(|t| serde_json::from_str::<Info>(&t).ok()) else { continue };
+        let thumb_png = sys::db_get_bytes(&thumb_key(id)).await;
+        entries.push(Entry { id: id.to_string(), info, thumb_png, thumb: None });
+    }
+    entries.sort_by(|a, b| b.info.modified.total_cmp(&a.info.modified));
+    (entries, sys::db_get_text(CURRENT_KEY).await)
+}
+
+/// Lee un proyecto y deja sus fotos y su fuente listas en memoria.
+async fn load_project(id: &str) -> Option<Saved> {
+    let saved: Saved = serde_json::from_str(&sys::db_get_text(&doc_key(id)).await?).ok()?;
+    for p in project::doc_files(&saved.doc) {
+        if !sys::has_file(&p) {
+            if let Some(bytes) = sys::db_get_bytes(&file_key(&p)).await {
+                sys::store_at(p, bytes);
+            }
         }
     }
+    Some(saved)
+}
+
+/// Borra las fotos que ya no usa ningún proyecto.
+async fn collect_garbage(used: HashSet<String>) {
     for key in sys::db_keys().await {
-        if key.strip_prefix(FILE_PREFIX).is_some_and(|p| !wanted.contains(Path::new(p))) {
+        if key.strip_prefix(FILE_PREFIX).is_some_and(|p| !used.contains(p)) {
             sys::db_delete(&key).await;
         }
     }
-    saved
+}
+
+fn used_files(entries: &[Entry]) -> HashSet<String> {
+    entries.iter().flat_map(|e| e.info.files.iter().cloned()).collect()
+}
+
+/// Lo que se pide desde la ventana de proyectos.
+enum ProjectAction {
+    Open(String),
+    Duplicate(String),
+    Delete(String),
+    Rename(String, String),
+    New,
+    Import,
 }
 
 impl App {
@@ -152,34 +266,57 @@ impl App {
         self.web.can_share = sys::can_share_files();
         let (tx, ctx) = (self.web.tx.clone(), ctx.clone());
         sys::spawn(async move {
-            let saved = restore().await;
-            Self::send_job(&tx, &ctx, move |app, ctx| app.finish_restore(saved, ctx));
+            let (entries, current) = load_index().await;
+            let current = current.filter(|c| entries.iter().any(|e| &e.id == c)).or_else(|| entries.first().map(|e| e.id.clone()));
+            let saved = match &current {
+                Some(id) => load_project(id).await.map(|s| (id.clone(), s)),
+                None => None,
+            };
+            collect_garbage(used_files(&entries)).await;
+            Self::send_job(&tx, &ctx, move |app, ctx| app.finish_restore(entries, saved, ctx));
         });
     }
 
-    fn finish_restore(&mut self, saved: Option<Saved>, ctx: &egui::Context) {
+    fn finish_restore(&mut self, entries: Vec<Entry>, saved: Option<(String, Saved)>, ctx: &egui::Context) {
+        self.web.projects = entries;
         self.web.restored = true;
-        // Si ya empezaste a trabajar mientras tanto, no se pisa.
+        // Si empezaste a trabajar mientras tanto, eso sigue como proyecto nuevo.
         let untouched = self.doc.layers.is_empty() && self.undo.is_empty();
-        if let Some(s) = saved.filter(|_| untouched) {
-            self.web.saved_files = doc_files(&s.doc).into_iter().filter(|p| sys::has_file(p)).collect();
-            let has_content = !s.doc.layers.is_empty();
-            self.set_doc(s.doc, s.name.map(PathBuf::from), ctx);
-            self.undo.clear();
-            self.redo.clear();
-            self.dirty = s.dirty;
-            if has_content {
-                self.status = "Se recuperó tu último proyecto.".into();
+        match saved.filter(|_| untouched) {
+            Some((id, s)) => {
+                let has_content = !s.doc.layers.is_empty();
+                self.load_into(id, s, ctx);
+                if has_content {
+                    self.status = format!("Se abrió «{}», tu último proyecto.", self.doc_name());
+                }
+            }
+            None => {
+                self.web.current = new_id();
+                self.web.saved_json.clear();
             }
         }
-        self.web.saved_json = self.autosave_json();
         // Para entonces los paneles ya tienen su tamaño final.
         self.fit_request = true;
     }
 
+    /// Pone en pantalla un proyecto leído del navegador.
+    fn load_into(&mut self, id: String, s: Saved, ctx: &egui::Context) {
+        let name = self.web.projects.iter().find(|e| e.id == id).map(|e| e.info.name.clone()).unwrap_or_else(|| "Sin título".into());
+        let files = project::doc_files(&s.doc);
+        self.web.saved_files = files.iter().filter(|p| sys::has_file(p)).cloned().collect();
+        self.images.retain(|p, _| files.contains(p));
+        self.set_doc(s.doc, Some(PathBuf::from(format!("{name}.carrusel"))), ctx);
+        self.undo.clear();
+        self.redo.clear();
+        self.dirty = s.dirty;
+        self.web.current = id;
+        self.web.saved_json = self.autosave_json();
+        self.web.thumb_for = hash(&self.web.saved_json);
+        spawn_write(sys::db_set_text(CURRENT_KEY, &self.web.current));
+    }
+
     fn autosave_json(&self) -> String {
-        let name = self.path.as_ref().and_then(|p| p.to_str());
-        serde_json::to_string(&SavedRef { name, dirty: self.dirty, doc: &self.doc }).unwrap_or_default()
+        serde_json::to_string(&SavedRef { dirty: self.dirty, doc: &self.doc }).unwrap_or_default()
     }
 
     /// Guarda el proyecto en el navegador si cambió (como mucho una vez por segundo).
@@ -188,25 +325,64 @@ impl App {
         if json == self.web.saved_json {
             return;
         }
+        let id = self.web.current.clone();
+        let listed = self.web.projects.iter().any(|e| e.id == id);
+        // Un proyecto nuevo y vacío no se guarda (no llena la lista de «Sin título»).
+        if !listed && self.doc.layers.is_empty() {
+            return;
+        }
         // Primero las fotos nuevas, luego el documento que las usa (IndexedDB
         // respeta el orden de las escrituras).
-        for p in doc_files(&self.doc) {
+        for p in project::doc_files(&self.doc) {
             if self.web.saved_files.contains(&p) {
                 continue;
             }
             if let Some(bytes) = sys::file_bytes(&p) {
-                let write = sys::db_set_bytes(&file_key(&p), &bytes);
-                sys::spawn(async move {
-                    write.await;
-                });
+                spawn_write(sys::db_set_bytes(&file_key(&p), &bytes));
                 self.web.saved_files.insert(p);
             }
         }
-        let write = sys::db_set_text(DOC_KEY, &json);
-        sys::spawn(async move {
-            write.await;
-        });
+        spawn_write(sys::db_set_text(&doc_key(&id), &json));
+        let info = Info { name: self.doc_name(), modified: sys::now_ms(), files: file_list(&self.doc) };
+        spawn_write(sys::db_set_text(&info_key(&id), &serde_json::to_string(&info).unwrap_or_default()));
+        match self.web.projects.iter().position(|e| e.id == id) {
+            Some(i) => {
+                let mut e = self.web.projects.remove(i);
+                e.info = info;
+                self.web.projects.insert(0, e);
+            }
+            None => self.web.projects.insert(0, Entry { id, info, thumb_png: None, thumb: None }),
+        }
         self.web.saved_json = json;
+    }
+
+    /// Miniatura de los primeros slides del proyecto abierto, si cambió.
+    fn update_thumb(&mut self) {
+        let h = hash(&self.web.saved_json);
+        if h == self.web.thumb_for || self.pending > 0 || self.doc.layers.is_empty() {
+            return;
+        }
+        let Some(i) = self.web.projects.iter().position(|e| e.id == self.web.current) else { return };
+        let images: HashMap<PathBuf, Arc<RgbaImage>> = self.images.iter().map(|(k, v)| (k.clone(), v.full.clone())).collect();
+        let (sw, sh) = self.doc.format.size();
+        let n = self.doc.slides.min(3);
+        let strip = render::render_region(&self.doc, &images, &self.font, 0.0, sw * n);
+        let th = 120;
+        let tw = (sw * n * th / sh).max(1);
+        let small = image::imageops::thumbnail(&strip, tw, th);
+        if let Ok(png) = render::encode_image(small, ExportFormat::Png) {
+            spawn_write(sys::db_set_bytes(&thumb_key(&self.web.current), &png));
+            let e = &mut self.web.projects[i];
+            e.thumb_png = Some(png);
+            e.thumb = None;
+        }
+        self.web.thumb_for = h;
+    }
+
+    /// Deja guardado el proyecto abierto antes de cambiar a otro.
+    fn flush(&mut self) {
+        self.autosave();
+        self.update_thumb();
     }
 
     /// Lo que la versión web hace en cada fotograma.
@@ -239,7 +415,289 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Fotos, fuentes y proyectos
+    // Ventana «Proyectos»
+
+    /// «Proyectos…» (y ⌘O): la lista de proyectos guardados en el navegador.
+    pub(crate) fn web_open(&mut self, _ctx: &egui::Context) {
+        if self.web.restored {
+            self.flush();
+        }
+        self.web.show_projects = true;
+    }
+
+    pub(crate) fn web_new_project(&mut self, ctx: &egui::Context) {
+        if self.web.restored {
+            self.flush();
+        }
+        self.start_new_project(ctx);
+        self.status = "Proyecto nuevo. El anterior sigue en «Proyectos…».".into();
+    }
+
+    fn start_new_project(&mut self, ctx: &egui::Context) {
+        self.set_doc(Doc::default(), None, ctx);
+        self.undo.clear();
+        self.redo.clear();
+        self.web.current = new_id();
+        self.web.saved_json.clear();
+        self.web.saved_files.clear();
+        spawn_write(sys::db_set_text(CURRENT_KEY, &self.web.current));
+    }
+
+    fn open_project(&mut self, id: String, ctx: &egui::Context) {
+        self.flush();
+        let (tx, ctx) = (self.web.tx.clone(), ctx.clone());
+        self.status = "Abriendo…".into();
+        sys::spawn(async move {
+            let saved = load_project(&id).await;
+            Self::send_job(&tx, &ctx, move |app, ctx| match saved {
+                Some(s) => {
+                    app.load_into(id, s, ctx);
+                    app.status = format!("Abierto «{}».", app.doc_name());
+                }
+                None => app.status = "No se pudo abrir ese proyecto.".into(),
+            });
+        });
+    }
+
+    fn duplicate_project(&mut self, id: String, ctx: &egui::Context) {
+        if id == self.web.current {
+            self.flush();
+        }
+        let Some(e) = self.web.projects.iter().find(|e| e.id == id) else { return };
+        let mut info = e.info.clone();
+        info.name = format!("{} (copia)", info.name);
+        info.modified = sys::now_ms();
+        let thumb = e.thumb_png.clone();
+        let (tx, ctx) = (self.web.tx.clone(), ctx.clone());
+        sys::spawn(async move {
+            let Some(text) = sys::db_get_text(&doc_key(&id)).await else { return };
+            let new = new_id();
+            sys::db_set_text(&doc_key(&new), &text).await;
+            sys::db_set_text(&info_key(&new), &serde_json::to_string(&info).unwrap_or_default()).await;
+            if let Some(png) = &thumb {
+                sys::db_set_bytes(&thumb_key(&new), png).await;
+            }
+            Self::send_job(&tx, &ctx, move |app, _| {
+                app.status = format!("Creado «{}».", info.name);
+                app.web.projects.insert(0, Entry { id: new, info, thumb_png: thumb, thumb: None });
+            });
+        });
+    }
+
+    fn delete_project(&mut self, id: String, ctx: &egui::Context) {
+        let Some(i) = self.web.projects.iter().position(|e| e.id == id) else { return };
+        let name = self.web.projects[i].info.name.clone();
+        if !sys::confirm(&format!("¿Eliminar «{name}» de este navegador?\n\nNo se puede deshacer.")) {
+            return;
+        }
+        self.web.projects.remove(i);
+        if id == self.web.current {
+            // No se guarda nada más de él: se abre otro (o uno nuevo).
+            self.web.saved_json = self.autosave_json();
+            match self.web.projects.first().map(|e| e.id.clone()) {
+                Some(next) => self.open_project_without_flush(next, ctx),
+                None => self.start_new_project(ctx),
+            }
+        }
+        let used = used_files(&self.web.projects);
+        sys::spawn(async move {
+            for key in [doc_key(&id), info_key(&id), thumb_key(&id)] {
+                sys::db_delete(&key).await;
+            }
+            collect_garbage(used).await;
+        });
+        self.status = format!("Eliminado «{name}».");
+    }
+
+    fn open_project_without_flush(&mut self, id: String, ctx: &egui::Context) {
+        let (tx, ctx) = (self.web.tx.clone(), ctx.clone());
+        sys::spawn(async move {
+            let saved = load_project(&id).await;
+            Self::send_job(&tx, &ctx, move |app, ctx| match saved {
+                Some(s) => app.load_into(id, s, ctx),
+                None => app.start_new_project(ctx),
+            });
+        });
+    }
+
+    fn rename_project(&mut self, id: String, name: String) {
+        let name = clean_name(&name);
+        if id == self.web.current {
+            self.path = Some(PathBuf::from(format!("{name}.carrusel")));
+        }
+        if let Some(e) = self.web.projects.iter_mut().find(|e| e.id == id) {
+            e.info.name = name;
+            spawn_write(sys::db_set_text(&info_key(&id), &serde_json::to_string(&e.info).unwrap_or_default()));
+        }
+    }
+
+    /// Importa un .carrusel (de la Mac o descargado antes) como proyecto nuevo.
+    fn import_project(&mut self, ctx: &egui::Context) {
+        let picked = sys::pick_files("", false);
+        let (tx, ctx) = (self.web.tx.clone(), ctx.clone());
+        sys::spawn(async move {
+            let Some(f) = picked.await.into_iter().next() else { return };
+            Self::send_job(&tx, &ctx, move |app, ctx| app.import_file(&f.name, &f.bytes, ctx));
+        });
+    }
+
+    fn import_file(&mut self, file_name: &str, bytes: &[u8], ctx: &egui::Context) {
+        let opened = match project::parse(bytes) {
+            Ok(o) => o,
+            Err(e) => {
+                self.status = format!("No se pudo abrir «{file_name}»: {e}");
+                return;
+            }
+        };
+        for (path, data) in opened.files {
+            sys::store_at(path, data);
+        }
+        let missing = project::doc_files(&opened.doc).iter().filter(|p| !sys::has_file(p)).count();
+        let name = clean_name(&Path::new(file_name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        self.flush();
+        self.start_new_project(ctx);
+        self.set_doc(opened.doc, Some(PathBuf::from(format!("{name}.carrusel"))), ctx);
+        self.undo.clear();
+        self.web.show_projects = false;
+        self.status = if missing > 0 {
+            format!("Abierto «{name}», pero faltan {missing} archivo(s): en la Mac guárdalo con «Guardar con fotos…».")
+        } else {
+            format!("Abierto «{name}».")
+        };
+    }
+
+    /// Ventana con los proyectos guardados en este navegador.
+    pub(crate) fn projects_window(&mut self, ctx: &egui::Context) {
+        if !self.web.show_projects {
+            return;
+        }
+        let mut open = true;
+        let mut action = None;
+        egui::Window::new("Proyectos")
+            .open(&mut open)
+            .default_size([520.0, 520.0])
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("＋ Proyecto nuevo").clicked() {
+                        action = Some(ProjectAction::New);
+                    }
+                    if ui.button("Importar .carrusel…").on_hover_text("Un proyecto guardado en la Mac o descargado antes").clicked() {
+                        action = Some(ProjectAction::Import);
+                    }
+                });
+                ui.weak("Se guardan solos en este navegador. Para tener una copia o llevar uno a la Mac, ábrelo y toca «Guardar».");
+                ui.separator();
+                if self.web.projects.is_empty() {
+                    ui.weak("Todavía no hay proyectos guardados.");
+                    return;
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for i in 0..self.web.projects.len() {
+                        if let Some(a) = self.project_row(ui, i) {
+                            action = Some(a);
+                        }
+                        ui.separator();
+                    }
+                });
+            });
+        if !open {
+            self.web.show_projects = false;
+            self.web.renaming = None;
+        }
+        match action {
+            Some(ProjectAction::Open(id)) => {
+                self.web.show_projects = false;
+                self.open_project(id, ctx);
+            }
+            Some(ProjectAction::Duplicate(id)) => self.duplicate_project(id, ctx),
+            Some(ProjectAction::Delete(id)) => self.delete_project(id, ctx),
+            Some(ProjectAction::Rename(id, name)) => self.rename_project(id, name),
+            Some(ProjectAction::New) => {
+                self.web.show_projects = false;
+                self.web_new_project(ctx);
+            }
+            Some(ProjectAction::Import) => self.import_project(ctx),
+            None => {}
+        }
+    }
+
+    fn project_row(&mut self, ui: &mut egui::Ui, i: usize) -> Option<ProjectAction> {
+        let ctx = ui.ctx().clone();
+        let current = self.web.projects[i].id == self.web.current;
+        let mut action = None;
+        ui.horizontal(|ui| {
+            let e = &mut self.web.projects[i];
+            if e.thumb.is_none() {
+                if let Some(img) = e.thumb_png.as_ref().and_then(|b| image::load_from_memory(b).ok()).map(|i| i.to_rgba8()) {
+                    let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                    e.thumb = Some(ctx.load_texture(format!("proyecto:{}", e.id), color, egui::TextureOptions::LINEAR));
+                }
+            }
+            let box_size = Vec2::new(150.0, 64.0);
+            let (rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+            ui.painter().rect_filled(rect, 4.0, Color32::from_gray(45));
+            if let Some(t) = &e.thumb {
+                let s = (box_size.x / t.size_vec2().x).min(box_size.y / t.size_vec2().y);
+                let r = egui::Rect::from_center_size(rect.center(), t.size_vec2() * s);
+                let full = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
+                ui.painter().image(t.id(), r, full, Color32::WHITE);
+            }
+            let id = e.id.clone();
+            let mut cancel = false;
+            ui.vertical(|ui| {
+                match &mut self.web.renaming {
+                    Some((rid, text)) if *rid == id => {
+                        let resp = ui.add(egui::TextEdit::singleline(text).desired_width(220.0));
+                        resp.request_focus();
+                        let enter = ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+                        ui.horizontal(|ui| {
+                            if ui.button("Aceptar").clicked() || enter {
+                                action = Some(ProjectAction::Rename(id.clone(), text.clone()));
+                            }
+                            if ui.button("Cancelar").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    }
+                    _ => {
+                        let e = &self.web.projects[i];
+                        let mut title = egui::RichText::new(&e.info.name).strong();
+                        if current {
+                            title = title.color(ACCENT);
+                        }
+                        ui.label(title);
+                        let when = format_date(e.info.modified);
+                        ui.weak(if current { format!("Abierto · {when}") } else { when });
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!current, egui::Button::new("Abrir")).clicked() {
+                                action = Some(ProjectAction::Open(id.clone()));
+                            }
+                            if ui.button("Duplicar").clicked() {
+                                action = Some(ProjectAction::Duplicate(id.clone()));
+                            }
+                            if ui.button("Renombrar").clicked() {
+                                self.web.renaming = Some((id.clone(), e.info.name.clone()));
+                            }
+                            if ui.button(egui::RichText::new("Eliminar").color(Color32::from_rgb(255, 120, 120))).clicked() {
+                                action = Some(ProjectAction::Delete(id.clone()));
+                            }
+                        });
+                    }
+                }
+            });
+            if cancel {
+                self.web.renaming = None;
+            }
+        });
+        if matches!(action, Some(ProjectAction::Rename(..))) {
+            self.web.renaming = None;
+        }
+        action
+    }
+
+    // -----------------------------------------------------------------------
+    // Fotos y fuentes
 
     pub(crate) fn web_pick_media(&mut self, ctx: &egui::Context) {
         // «image/*» abre la fototeca del iPad (y convierte HEIC a JPG).
@@ -296,47 +754,11 @@ impl App {
         });
     }
 
-    pub(crate) fn web_open(&mut self, ctx: &egui::Context) {
-        let picked = sys::pick_files("", false);
-        let (tx, ctx) = (self.web.tx.clone(), ctx.clone());
-        sys::spawn(async move {
-            let Some(f) = picked.await.into_iter().next() else { return };
-            Self::send_job(&tx, &ctx, move |app, ctx| app.open_project_file(&f.name, &f.bytes, ctx));
-        });
-    }
-
-    fn open_project_file(&mut self, name: &str, bytes: &[u8], ctx: &egui::Context) {
-        let (doc, files) = match parse_project(bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                self.status = format!("No se pudo abrir «{name}»: {e}");
-                return;
-            }
-        };
-        for (path, data) in files {
-            sys::store_at(path, data);
-        }
-        let missing = doc_files(&doc).iter().filter(|p| !sys::has_file(p)).count();
-        self.web.saved_files.clear();
-        self.set_doc(doc, Some(PathBuf::from(name)), ctx);
-        self.status = if missing > 0 {
-            format!("Abierto «{name}», pero faltan {missing} archivo(s): el proyecto se guardó en la Mac sin sus fotos.")
-        } else {
-            format!("Abierto «{name}».")
-        };
-    }
-
-    /// «Guardar» descarga el proyecto con sus fotos en un solo archivo.
+    /// «Guardar» descarga el proyecto con sus fotos en un solo archivo, que
+    /// también abre la app de la Mac.
     pub(crate) fn web_save(&mut self) {
-        let mut files = BTreeMap::new();
-        for p in doc_files(&self.doc) {
-            if let Some(bytes) = sys::file_bytes(&p) {
-                files.insert(p.to_string_lossy().into_owned(), base64::engine::general_purpose::STANDARD.encode(&bytes[..]));
-            }
-        }
-        let bundle = BundleRef { carrusel: BUNDLE_VERSION, doc: &self.doc, files };
-        let json = match serde_json::to_vec(&bundle) {
-            Ok(j) => j,
+        let (json, _) = match project::bundle(&self.doc, |p| sys::file_bytes(p).map(|b| b.as_ref().clone())) {
+            Ok(r) => r,
             Err(e) => {
                 self.status = format!("No se pudo guardar: {e}");
                 return;
@@ -344,9 +766,8 @@ impl App {
         };
         let name = format!("{}.carrusel", self.doc_name());
         sys::download(&name, &json, "application/octet-stream");
-        self.path = Some(PathBuf::from(&name));
         self.dirty = false;
-        self.status = format!("Proyecto descargado: «{name}» (en iPad queda en Archivos › Descargas).");
+        self.status = format!("Proyecto descargado: «{name}» (en iPad queda en Archivos › Descargas; ábrelo en la Mac con «Abrir…»).");
     }
 
     // -----------------------------------------------------------------------
@@ -413,6 +834,11 @@ impl App {
                         let zip = zip_store(&export.files);
                         sys::download(&format!("{}-slides.zip", export.name), &zip, "application/zip");
                     }
+                    if ui.button("Descargar uno por uno").on_hover_text("Cada slide como su propio archivo (el navegador puede pedir permiso)").clicked() {
+                        for (name, bytes, mime) in &export.files {
+                            sys::download(name, bytes, mime);
+                        }
+                    }
                     if ui.button("Cerrar").clicked() {
                         close = true;
                     }
@@ -459,43 +885,6 @@ async fn export_files(
         progress(1.0);
     }
     Ok(files)
-}
-
-// ---------------------------------------------------------------------------
-// Proyecto en un solo archivo: el documento y sus fotos (en base64)
-
-const BUNDLE_VERSION: u32 = 1;
-
-#[derive(Serialize)]
-struct BundleRef<'a> {
-    carrusel: u32,
-    doc: &'a Doc,
-    files: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-struct Bundle {
-    carrusel: u32,
-    doc: Doc,
-    #[serde(default)]
-    files: BTreeMap<String, String>,
-}
-
-/// Lee un proyecto: el de la versión web (con fotos) o uno de la Mac (solo
-/// el documento, con rutas a fotos que aquí no existen).
-fn parse_project(bytes: &[u8]) -> Result<(Doc, Vec<(PathBuf, Vec<u8>)>), String> {
-    if let Ok(b) = serde_json::from_slice::<Bundle>(bytes) {
-        if b.carrusel > BUNDLE_VERSION {
-            return Err("es de una versión más nueva de Carrusel.".into());
-        }
-        let files = b
-            .files
-            .into_iter()
-            .filter_map(|(p, data)| base64::engine::general_purpose::STANDARD.decode(data).ok().map(|d| (PathBuf::from(p), d)))
-            .collect();
-        return Ok((b.doc, files));
-    }
-    serde_json::from_slice::<Doc>(bytes).map(|d| (d, Vec::new())).map_err(|_| "no es un proyecto de Carrusel.".to_string())
 }
 
 // ---------------------------------------------------------------------------

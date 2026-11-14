@@ -67,20 +67,11 @@ thread_local! {
     static FILES: RefCell<HashMap<PathBuf, Arc<Vec<u8>>>> = RefCell::new(HashMap::new());
 }
 
-/// Huella FNV-1a: el mismo archivo elegido dos veces comparte ruta.
-fn fingerprint(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h ^ bytes.len() as u64
-}
-
-/// Guarda un archivo elegido por el usuario y devuelve su ruta (inventada).
+/// Guarda un archivo elegido por el usuario y devuelve su ruta (inventada;
+/// el mismo archivo elegido dos veces comparte ruta).
 pub fn store_file(name: &str, bytes: Vec<u8>) -> PathBuf {
     let clean: String = name.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
-    let path = PathBuf::from(format!("web/{:016x}/{clean}", fingerprint(&bytes)));
+    let path = PathBuf::from(format!("web/{:016x}/{clean}", crate::project::fingerprint(&bytes)));
     store_at(path.clone(), bytes);
     path
 }
@@ -159,6 +150,16 @@ pub fn share_files(files: &[(String, Vec<u8>, &'static str)], title: &str) -> im
             other => Err(other.trim_start_matches("error: ").to_string()),
         }
     }
+}
+
+/// Guarda una fuente descargada y devuelve su ruta.
+pub fn save_font(name: &str, bytes: Vec<u8>) -> Result<PathBuf, String> {
+    Ok(store_file(name, bytes))
+}
+
+/// Milisegundos desde 1970 (para fechar los proyectos).
+pub fn now_ms() -> f64 {
+    js_sys::Date::now()
 }
 
 pub fn confirm(message: &str) -> bool {

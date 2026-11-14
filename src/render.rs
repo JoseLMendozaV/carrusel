@@ -91,6 +91,15 @@ fn blend(dst: &mut Rgba<u8>, color: [u8; 4], coverage: f32) {
     dst[3] = (out_a * 255.0).round() as u8;
 }
 
+/// Un texto de una línea dibujado sobre fondo transparente (muestras de fuentes).
+pub fn text_image(font: &FontArc, text: &str, size: f32, color: [u8; 4]) -> RgbaImage {
+    let (w, h) = measure_text(font, text, size);
+    let mut img = RgbaImage::new(w.ceil() as u32 + 2, h.ceil() as u32 + 2);
+    let kind = Kind::Text { text: text.into(), size, color, align: crate::doc::TextAlign::Left, background: None, shadow: false };
+    draw_text(&mut img, font, &Layer::new(0, kind, (1.0, 1.0, w, h)));
+    img
+}
+
 /// Relleno alrededor del texto cuando lleva recuadro de fondo.
 pub fn text_padding(size: f32) -> (f32, f32) {
     (size * 0.3, size * 0.15)
